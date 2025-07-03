@@ -4,7 +4,7 @@ gc()
 library(duckdb)
 library(dplyr)
 
-new_dtb_name <- "data/datacon25b.duckdb"
+new_dtb_name <- "data/datacon25.duckdb"
 ozp_file_name <- "../OZP_preskladane.csv"
 cpzp_file_name <- "../CPZP_preskladane.csv"
 kortizon_file_name <- "../kortizonove_ekvivalenty.csv"
