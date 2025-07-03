@@ -11,6 +11,13 @@ presc_id 	- z typu události a detailu události
 n_boxes 	- Pocet_baleni  •	Počet předepsaných balení u daného receptu
 date 		- Datum_udalosti•	Datum předpisu/vakcinace
 
+## tables vaccinations ##
+client_id
+date 		- Datum_udalosti•	Datum předpisu/vakcinace
+event_order - pořadí vakcinace (pro ozp dopočítáno)
+detail_id	- pouze u cpzp
+detail_code	- pouze u cpzp
+
 ## drugs_catalog ##
 detail_id  				- Detail_udalosti •	Kód SÚKL předepsaného léku
 detail_code / drug_name - Kod_udalosti / Nazev •	Název předepsaného léku/název očkovací látky
@@ -20,9 +27,9 @@ force   				- Sila•	Síla předepsaného léku
 subname  				- Doplnek_nazvu•	Doplněk názvu předepsaného léku
 drug_form  				- Lekova_forma•	Forma předepsaného léku
 medicinal_substances  	- Leciva_latka•	Léčivá látka v předepsaném léku
-equiv_substance  		-Equiv_sloucenina•	Sloučenina léčivé látky, která se využívá při přepočtu na prednisonové ekvivalenty (pouze u ATC skupiny začínající H02)
-Prednison_equiv  		-Prednison_equiv•	Koeficient přepočtu léčivé látky na prednisonový ekvivalent (pouze u ATC skupiny začínající H02)
-count_in_box  			-Pocet_v_baleni•	Počet léků/ml v balení
+equiv_substance  		- Equiv_sloucenina•	Sloučenina léčivé látky, která se využívá při přepočtu na prednisonové ekvivalenty (pouze u ATC skupiny začínající H02)
+Prednison_equiv  		- Prednison_equiv•	Koeficient přepočtu léčivé látky na prednisonový ekvivalent (pouze u ATC skupiny začínající H02)
+count_in_box  			- Pocet_v_baleni•	Počet léků/ml v balení
 presc_id 				- dopočteno, v cpzp +1000
 specialization 			- pouze u CPZP •	Specializace lékaře, který vydal daný předpis
 
