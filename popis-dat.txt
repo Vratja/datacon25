@@ -1,0 +1,87 @@
+## tables clients ##
+client_id 	- Id_pojistence • Unikátní identifikátor pojištěnce
+sex 		- Pohlavi • Pohlaví pojištěnce
+age 		-  2025-Rok_narozeni
+n_vacc 		- Pocet_vakcinaci  •	Počet vakcinací pro daného pojištěnce
+n_presc 	- Pocet_predpisu  •	Počet předpisů daného pojištěnce
+
+## tables prescriptions ##
+client_id
+presc_id 	- z typu události a detailu události
+n_boxes 	- Pocet_baleni  •	Počet předepsaných balení u daného receptu
+date 		- Datum_udalosti•	Datum předpisu/vakcinace
+
+## drugs_catalog ##
+detail_id  				- Detail_udalosti •	Kód SÚKL předepsaného léku
+detail_code / drug_name - Kod_udalosti / Nazev •	Název předepsaného léku/název očkovací látky
+drug_form_short  		- Lekova_forma_zkratka•	Zkratka lékové formy
+ATC_group   			- ATC_skupina•	ATC skupina předepsaného léku
+force   				- Sila•	Síla předepsaného léku
+subname  				- Doplnek_nazvu•	Doplněk názvu předepsaného léku
+drug_form  				- Lekova_forma•	Forma předepsaného léku
+medicinal_substances  	- Leciva_latka•	Léčivá látka v předepsaném léku
+equiv_substance  		-Equiv_sloucenina•	Sloučenina léčivé látky, která se využívá při přepočtu na prednisonové ekvivalenty (pouze u ATC skupiny začínající H02)
+Prednison_equiv  		-Prednison_equiv•	Koeficient přepočtu léčivé látky na prednisonový ekvivalent (pouze u ATC skupiny začínající H02)
+count_in_box  			-Pocet_v_baleni•	Počet léků/ml v balení
+presc_id 				- dopočteno, v cpzp +1000
+specialization 			- pouze u CPZP •	Specializace lékaře, který vydal daný předpis
+
+Vynechané:
+Posledni_zahajeni_pojisteni
+•	Datum zahájení pojištění daného pojištěnce
+Posledni_ukonceni_pojisteni
+•	Datum ukončení pojištění daného pojištěnce
+Typ_udalosti
+•	Předpis léků/vakcinace
+Ockovany
+•	0 – pacient není očkovaný, 1 – pacient je očkovaný
+Pouze u pojišťovny 1 (OZP):
+Datum_umrti
+•	Datum úmrtí pojištěnce
+Pouze u pojišťovny 2 (ČPZP):
+Mesic_narozeni
+•	Měsíc narození daného pojištěnce
+Mesic_umrti
+•	Měsíc úmrtí daného pojištěnce
+Rok_umrti
+•	Rok úmrtí daného pojištěnce
+
+
+
+Výzkumné otázky:
+
+-          Změnila se v období pandemie nějak celková spotřeba kortikoidů?
+
+-          Pokud ano, jak? Jsou trendy týkající se spotřeby kortikoidů stejné u očkované i neočkované populace? Chránily tedy vakcíny před nárůstem spotřeby kortikoidů, neměly žádný efekt, nebo dokonce škodily?
+
+-          Je rozdíl mezi jednotlivými věkovými skupinami?
+
+-          Jakékoliv další otázky, které Vás napadnou, jako např. časová souvislost mezi vakcinací (u neočkovaných pak obdobím maximální vakcinace v dané kohortě) a spotřebou kortikoidů (případně imunosupresiv)
+
+Na co si dát při analýze pozor?
+
+-          Lidé, kteří se očkovali, jsou obecně jiná skupina než ti, kteří se očkovat nenechali (různý zdravotní stav, různý přístup k vlastnímu zdraví). Proto je chyba porovnávat očkované proti neočkovaným tak, jak se to běžně dělá.
+
+-          Smysl dává tzv. self-controlled design – tedy sledovat změny v očkované skupině po-před vs změny v neočkované skupině po-před (při použití stejného rozhodného data – maxima vakcinace) v rozumném časovém intervalu.
+
+-          Tento interval nesmí být příliš dlouhý (kvůli „naředění“ efektu vakcinace, ať už ochranného, nebo negativního) ani příliš krátký.
+
+-          Důležitým zkreslujícím faktorem je i období – není rozumné dohromady hodnotit očkované v době covidových vln a očkované v bezcovidovém období. Vhodné je zahrnout například jen jedince očkované v období několika týdnů od maxima vakcinace.
+
+-          Pochopitelně je nutné analyzovat věkové kohorty zvlášť (mimo jiné i proto, že vakcinace jednotlivých věkových skupin byla spuštěna v různých obdobích, viz Slabá, J. Vládní boj proti pandemii: přehled opatření vydaných v souvislosti s pandemií onemocnění covid-19 v Česku v letech 2020 a 2021. Demografie, 64(2):175-196; https://doi.org/10.54694/dem.030)
+
+-          Zemřelí musí být z analýzy vyřazeni (kdo zemře, nemůže už dostat léky)
+
+-          Z tohoto důvodu asi nebude možné provést rozumnou a spolehlivou analýzu u starší populace, kde mnoho těch, kteří na tom byli zdravotně nejhůře, zemřelo. Navíc vhodnost vakcinace v nejstarších věkových skupinách v nejhorších obdobích asi nikdo nezpochybňuje. Doporučujeme tak soustředit se přednostně na mladší populaci.
+
+-          Jako parametry vyhodnocování je možné použít např. počet prvopředpisů, počet předpisů celkem nebo celkovou spotřebu kortikoidů přepočtenou na tzv. prednisonové ekvivalenty – ale budeme rádi, pokud přijdete s dalšími parametry.
+
+-          V surových datech je vždy kód SÚKL pro dané léčivo. Kolega byl tak laskav, že vytvořil i předpřipravenou tabulku obsahující další informace o léku získané na základě číselníku SÚKLu, nicméně doporučujeme každému týmu, aby vycházel z původních dat a informace o léku si na základě číselníku vytvořil sám. SÚKL přehledy je možné dohledat i stáhnout zde: https://prehledy.sukl.cz/prehled_leciv.html#/
+
+-          Data obsahují i informace o imunosupresivech (ATC skupina začíná L04). Tyto léky mají silnější účinek než kortikoidy (začínají H02), nicméně předpisy imunosupresiv budou pravděpodobně vzácnější a je otázkou, jestli jich bude dost na rozumnou analýzu.
+
+-          Přepočet spotřeby kortikoidů na prednisonové ekvivalenty uvedený v souboru (viz např. https://emedicine.medscape.com/article/2172042-overview) je jen přibližný, nebere např. v úvahu, jestli forma daného kortikosteroidu je prednisolon (s molekulární hmotností 360,4 g/mol) nebo prednisolon hydrochlorid (s molekulární hmotností o HCl, tedy 36,5 g/mol) vyšší. Domníváme se, že to pro tyto účely je postačující, ale pokud chcete dokonalost, je potřeba zapátrat po úplně správných dávkách.
+
+
+o   Kortizonove_ekvivalenty (správněji by mělo být prednisonové ekvivalenty) – koeficienty pro vynásobení dávky daného léku, po kterém se získá ekvivalentní množství prednisonu (tedy např. 50mg kortizonu při koeficientu 0,2 odpovídá 10mg prednisonu)
+

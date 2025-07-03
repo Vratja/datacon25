@@ -1,0 +1,156 @@
+---
+title: "datacon"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list=ls(all=TRUE))
+gc()
+library(dplyr)
+library(lubridate)
+library(duckdb)
+library(DBI)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(ggcorrplot)
+
+con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
+#dbDisconnect(con, shutdown = TRUE)
+```
+
+# Data
+
+```{r}
+sexn <- tbl(con, "ozp_clients") %>% count(sex) %>% as_tibble()
+sexn
+```
+
+## OZP předpisy
+
+```{r}
+presc_summary_ozp <- tbl(con, "ozp_prescriptions") %>%
+  mutate(month_start = floor_date(date, unit = "month")) %>%
+  group_by(month_start) %>% summarise(count = n(),  .groups = "drop") %>% 
+  as_tibble() %>% 
+  transmute(month_start, count_sc = scale(count), zp = "cpzp")
+
+presc_summary_cpzp <- tbl(con, "cpzp_prescriptions") %>%
+  mutate(month_start = floor_date(date, unit = "month")) %>%
+  group_by(month_start) %>% summarise(count = n(),  .groups = "drop") %>% 
+  as_tibble() %>% 
+  transmute(month_start, count_sc = scale(count), zp = "ozp")
+
+rbind(presc_summary_cpzp, presc_summary_ozp) %>% 
+  ggplot(aes(x = month_start, y = count_sc, col = zp, fill = zp)) +
+    geom_line() +
+    geom_point() +
+    geom_smooth(se = FALSE) +
+    scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+cor(presc_summary_cpzp$count_sc, presc_summary_ozp$count_sc)
+```
+
+### sex OZP
+
+```{r}
+query <- "
+  SELECT
+    DATE_TRUNC('month', p.date) AS month_start,
+    c.sex,
+    COUNT(*) AS count,
+    COUNT(*) * 1000.0 / sex_count.n AS count1000
+  FROM ozp_prescriptions p
+  JOIN ozp_clients c ON p.client_id = c.client_id
+  JOIN (
+      SELECT sex, COUNT(*) AS n
+      FROM ozp_clients
+      GROUP BY sex
+  ) AS sex_count ON c.sex = sex_count.sex
+  GROUP BY month_start, c.sex, sex_count.n
+  ORDER BY month_start, c.sex;
+"
+
+df_summary <- dbGetQuery(con, query)
+
+ggplot(df_summary, aes(x = month_start, y = count, colour = sex, fill = sex)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth(color = "black") +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(df_summary, aes(x = month_start, y = count1000, colour = sex, fill = sex)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth(color = "black") +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### age
+
+```{r}
+age_tbl <- tbl(con, "ozp_clients") %>% mutate(age_gr = ntile(age, 5)) %>% 
+  group_by(age_gr) %>% summarise(min_age = min(age, na.rm = TRUE), max_age = max(age, na.rm = TRUE), n = n(), .groups = "drop") %>% 
+  mutate(gr_names = paste(as.integer(min_age), as.integer(max_age), sep = "-")) %>% 
+  as_tibble() %>% arrange(age_gr)
+
+age_tbl
+```
+
+
+```{r fig.height=8}
+df_summary <- tbl(con, "ozp_prescriptions") %>% 
+  left_join(
+    tbl(con, "ozp_clients") %>% mutate(age_gr = ntile(age, 5)) %>% select(client_id, age_gr), by = "client_id"
+  ) %>% 
+  mutate(month_start = floor_date(date, unit = "month")) %>%
+  group_by(month_start, age_gr) %>% summarise(count = n(),  .groups = "drop") %>% 
+  as_tibble() %>% 
+  mutate(age_gr = factor(age_gr, levels = 1:5, labels = age_tbl$gr_names))
+
+ggplot(df_summary, aes(x = month_start, y = count, colour = age_gr, fill = age_gr)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth(color = "black", linewidth = 0.5) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(df_summary, aes(x = month_start, y = count, colour = age_gr, fill = age_gr)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth(color = "black", linewidth = 0.5) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~age_gr, scales = "free_y", ncol = 1, strip.position = "left")
+```
+
+```{r}
+df_wide <- df_summary %>% arrange(age_gr) %>% 
+  tidyr::pivot_wider(names_from = age_gr, values_from = count, names_prefix = "age_")
+
+df_corr <- df_wide %>%
+  dplyr::select(starts_with("age_")) %>%
+  cor(use = "pairwise.complete.obs")
+
+ggcorrplot(df_corr, 
+           type = "lower", 
+           lab = TRUE, 
+           lab_size = 5, 
+           colors = c("blue", "white", "red"),
+           title = "Korelace mezi věkovými skupinami")
+```
+
