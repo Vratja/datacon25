@@ -29,7 +29,7 @@ dbExecute(
 
 query_ozp <- "
   SELECT DISTINCT
-    Id_pojistence,
+    Id_pojistence AS client_id,
 
     FIRST_VALUE(Posledni_zahajeni_pojisteni) OVER (
       PARTITION BY Id_pojistence
@@ -84,7 +84,7 @@ dbExecute(
 
 query_cpzp <- "
   SELECT DISTINCT
-    Id_pojistence,
+    Id_pojistence AS client_id,
 
     FIRST_VALUE(Posledni_zahajeni_pojisteni) OVER (
       PARTITION BY Id_pojistence
