@@ -15,13 +15,12 @@ ozp <- read.table(ozp_file_name, sep = ",", header = TRUE)
 
 ###### clients ######
 ozp_clients <- ozp %>% 
-  filter(is.na(Datum_umrti)) %>%
   distinct(Id_pojistence, .keep_all = TRUE) %>% 
-  transmute(client_id = Id_pojistence, sex = as.factor(Pohlavi), age = 2025-Rok_narozeni, n_vacc = pocet_vakcinaci, n_presc = pocet_predpisu)
+  transmute(client_id = Id_pojistence, sex = as.factor(Pohlavi), birthyear = Rok_narozeni, age = 2025-Rok_narozeni, n_vacc = pocet_vakcinaci, n_presc = pocet_predpisu)
 
 ###### prescriptions ######
 ozp_drugs_catalog <- ozp %>% 
-  filter(is.na(Datum_umrti), Typ_udalosti == "předpis") %>% 
+  filter(Typ_udalosti == "předpis") %>% 
   distinct(
     Detail_udalosti, Nazev, léková_forma_zkr, ATC_skupina, síla, doplněk_názvu, léková_forma, léčivé_látky, Equiv_sloucenina, Prednison_equiv, Pocet_v_baleni
   ) %>% 
@@ -32,7 +31,7 @@ ozp_drugs_catalog <- ozp %>%
   ) %>% mutate(presc_id = 1:n())
 
 ozp_prescriptions <- ozp %>% 
-  filter(is.na(Datum_umrti), Typ_udalosti == "předpis") %>% 
+  filter(Typ_udalosti == "předpis") %>% 
   transmute(client_id = Id_pojistence, detail_id = Detail_udalosti, drug_name = Nazev, n_boxes = Pocet_baleni, date = as.Date(Datum_udalosti)) %>% 
   left_join(
     ozp_drugs_catalog %>% transmute(detail_id, drug_name, presc_id), by = c("detail_id", "drug_name")
@@ -42,7 +41,7 @@ ozp_prescriptions <- ozp %>%
 
 ###### vaccination ######
 ozp_vaccinations <- ozp %>% 
-  filter(is.na(Datum_umrti), Typ_udalosti == "vakcinace") %>% 
+  filter(Typ_udalosti == "vakcinace") %>% 
   transmute(client_id = Id_pojistence, detail_id = Detail_udalosti, date = as.Date(Datum_udalosti)) %>% 
   arrange(client_id, date) %>%  
   group_by(client_id) %>% mutate(event_order = row_number()) %>%
@@ -64,14 +63,13 @@ rm(ozp, ozp_vaccinations, ozp_prescriptions, ozp_drugs_catalog, ozp_clients)
 cpzp <- read.table(cpzp_file_name, sep = ",", header = TRUE)
 
 ###### clients ######
-cpzp_clients <- cpzp %>% 
-  filter(is.na(Datum_umrti)) %>%
+cpzp_clients <- cpzp %>%
   distinct(Id_pojistence, .keep_all = TRUE) %>% 
-  transmute(client_id = Id_pojistence, sex = as.factor(Pohlavi), age = 2025-Rok_narozeni, n_vacc = pocet_vakcinaci, n_presc = pocet_predpisu)
+  transmute(client_id = Id_pojistence, sex = as.factor(Pohlavi), birthyear = Rok_narozeni, age = 2025-Rok_narozeni, n_vacc = pocet_vakcinaci, n_presc = pocet_predpisu)
 
 ###### prescriptions ######
 cpzp_drugs_catalog <- cpzp %>% 
-  filter(is.na(Datum_umrti), Typ_udalosti == "předpis") %>% 
+  filter(Typ_udalosti == "předpis") %>% 
   distinct(Detail_udalosti, Kod_udalosti, léková_forma_zkr, ATC_skupina, síla, doplněk_názvu, léková_forma, 
            léčivé_látky, Equiv_sloucenina, Prednison_equiv, Pocet_v_baleni) %>% 
   transmute(
@@ -81,7 +79,7 @@ cpzp_drugs_catalog <- cpzp %>%
   ) %>% mutate(presc_id = (1:n()) + 1000)
 
 cpzp_prescriptions <- cpzp %>% 
-  filter(is.na(Datum_umrti), Typ_udalosti == "předpis") %>% 
+  filter(Typ_udalosti == "předpis") %>% 
   transmute(client_id = Id_pojistence, detail_id = Detail_udalosti, detail_code = Kod_udalosti, n_boxes = Pocet_baleni, 
             date = as.Date(Datum_udalosti), specialization = Specializace) %>% 
   left_join(
@@ -91,7 +89,7 @@ cpzp_prescriptions <- cpzp %>%
 
 ###### vaccination ######
 cpzp_vaccinations <- cpzp %>% 
-  filter(is.na(Datum_umrti), Typ_udalosti == "vakcinace") %>% 
+  filter(Typ_udalosti == "vakcinace") %>% 
   transmute(client_id = Id_pojistence, detail_id = Detail_udalosti, detail_code = Kod_udalosti, event_order = poradi, date = as.Date(Datum_udalosti))
 
 #### saving to dtb ####
