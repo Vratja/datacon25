@@ -1,0 +1,25 @@
+---
+title: "Datacon_EDA_Sam"
+output: html_document
+date: "2025-07-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list=ls(all=TRUE))
+gc()
+library(dplyr)
+library(lubridate)
+library(duckdb)
+library(DBI)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(ggcorrplot)
+
+con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
+#dbDisconnect(con, shutdown = TRUE)
+```

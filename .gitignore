@@ -1,4 +1,5 @@
 data/datacon25.duckdb
+data/datacon25_merged.duckdb
 .RData
 .Rhistory
 .Rproj.user
