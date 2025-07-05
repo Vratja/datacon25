@@ -18,8 +18,38 @@ library(DBI)
 library(ggplot2)
 library(tibble)
 library(tidyr)
-library(ggcorrplot)
 
 con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
 #dbDisconnect(con, shutdown = TRUE)
+```
+```{r}
+vaccination_first_shot_overall <- dbGetQuery(con,
+                                "
+                                SELECT DISTINCT
+                                date,
+                                COUNT(DISTINCT client_id) OVER (
+                                PARTITION BY date) AS vaccinated_total_in_day
+                                FROM ozp_vaccinations
+                                WHERE event_order = 1
+                                ")
+
+total_population_count <- dbGetQuery(con,
+                                     "
+                                     SELECT
+                                     COUNT(DISTINCT client_id)
+                                     FROM ozp_clients
+                                     ")[[1]]
+
+vaccination_first_shot_cumulative <- vaccination_first_shot_overall %>%
+  arrange(date) %>%
+  mutate(vaccinated_ratio = cumsum(vaccinated_total_in_day) / total_population_count)
+
+ggplot(vaccination_first_shot_cumulative, aes(x = date, y = vaccinated_ratio)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  labs(
+    title = "Vaccinated Ratio Over Time",
+    x = "Date",
+    y = "Vaccinated Ratio"
+  ) +
+  theme_minimal()
 ```
