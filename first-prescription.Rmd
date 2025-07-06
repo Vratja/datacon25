@@ -1,0 +1,214 @@
+---
+title: "first prescription"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+rm(list=ls(all=TRUE))
+gc()
+library(dplyr)
+library(lubridate)
+library(duckdb)
+library(DBI)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(ggcorrplot)
+library(SCCS)
+
+con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
+#dbDisconnect(con, shutdown = TRUE)
+```
+
+# Základní přehled
+
+Vybráni pouze očkovaní klienti s alespoň jedním předpisem kortikoidů mezi roky 2016 a 2024. U vakcinace vybrány pouze 1.-4. dávka
+
+- dále vybrat všechny s jakýmkoli predpisem rok před a rok po vakcinaci
+
+```{r}
+cl11 <- tbl(con, "ozp_clients") %>% 
+  filter(n_vacc > 0, n_presc > 0)
+
+vacc <- tbl(con, "ozp_vaccinations") %>% 
+  filter(event_order <= 4) %>% 
+  semi_join(cl11, by = "client_id") %>% 
+  select(client_id, vacc_date = date, event_order)
+
+presc <- tbl(con, "ozp_prescriptions") %>% 
+  semi_join(cl11, by = "client_id") %>% 
+  group_by(client_id) %>% 
+  summarise(presc_date = min(date, na.rm = TRUE), .groups = "drop") %>% 
+  filter(year(presc_date) >= 2016, year(presc_date) <= 2024)
+
+clients11 <- cl11 %>% 
+  full_join(vacc, by = "client_id") %>% 
+  inner_join(presc, by = "client_id") %>% 
+  collect()
+
+```
+
+Zobrazení měsíčních součtů prvopředpisů a jednotlivých dávek.
+
+
+```{r}
+bind_rows(
+  presc %>%
+    group_by(YR = year(presc_date), M = month(presc_date)) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(type = "presc", event_order = 1) %>% collect(),
+
+  vacc %>%
+    group_by(YR = year(vacc_date), M = month(vacc_date), event_order) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(type = "vacc") %>% collect()
+) %>%
+  ggplot(aes(x = make_date(YR, M, 15), y = n, col = as.factor(event_order))) +
+  geom_line() +
+  facet_wrap(~type, scales = "free_y", ncol = 1) +
+  labs(col = "event_order", x = "date", y = "n")
+```
+
+Ppočet prvopředpisů vztažený ke dni vakcinace. V úvahu byly brány pouze předpisy dva roky od první vakcinace tam i zpět.
+
+```{r}
+clients11 %>% mutate(diff_month = floor(as.numeric(presc_date - vacc_date)/30)) %>% 
+  filter(abs(diff_month) <= 24) %>% 
+ggplot(aes(x = diff_month, fill = sex)) +
+  geom_histogram(binwidth = 1, color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Počet předpisů ke dni vakcinace", x = "Měsíc relativně k vakcinaci", y = "Počet předpisů") + 
+  facet_wrap(~event_order, ncol = 1, strip.position = "right",
+             labeller = labeller(event_order = function(x) paste0("dávka: ", x)))
+```
+
+Q: Dochází ke změně rizika podání/předpisu léků v určitém období po vakcinaci ve srovnání s jinými obdobími?
+
+## H1 (obecná):
+
+Hypotéza: Riziko prvního předepsání kortikoidů je vyšší v určitém období po vakcinaci než v jiných obdobích.
+
+* H0: Incidence předpisu léku je stejná v rizikovém a nerizikovém období.
+* H1: Incidence předpisu léku je vyšší (nebo nižší) v rizikovém období po vakcinaci.
+
+### Samostatný výpočet bez SCCS
+
+hodnota irr kolem 1 znamena, ze se nic nedeje. menzi je zlepseni, vetsi je zhorseni
+
+```{r}
+minDate <- as.Date("2020-1-1")
+
+cl <- clients11 %>% 
+  filter(event_order == 1, year(presc_date) %in% c(2020, 2021), year(vacc_date) %in% c(2021)) %>% 
+  transmute(client_id, vacc_day = as.integer(vacc_date - minDate), presc_day = as.integer(presc_date - minDate), age, sex) %>% 
+  mutate(astart = 1, aend = 2*365, id = 1:n())
+
+# Definujeme rizikové období: 0–14 dní po očkování
+riskInt = 5
+is_risk_period <- (cl$presc_day >= cl$vacc_day) & (cl$presc_day <= cl$vacc_day + riskInt)
+
+# Vytvoříme datový rámec
+df <- data.frame(
+  id = cl$client_id,
+  vaccination_day = cl$vacc_day,
+  prescription_day = cl$presc_day,
+  is_risk_period
+)
+
+head(df)
+
+# Délka období
+risk_period_days <- riskInt   # 0–14 včetně
+total_followup_days <- 2*365
+
+# Výpočty
+n_risk <- sum(df$is_risk_period)
+n_total <- nrow(df)
+n_control <- n_total - n_risk
+n <- cl100$client_id %>% unique() %>% length()
+
+# Časová expozice (součet dnů ve všech obdobích)
+exposure_risk <- n * risk_period_days
+exposure_control <- n * (total_followup_days - risk_period_days)
+
+# Incidenční poměry
+rate_risk <- n_risk / exposure_risk
+rate_control <- n_control / exposure_control
+
+# Incidence rate ratio
+irr <- rate_risk / rate_control
+
+cat("IRR (rizikové vs. kontrolní období):", round(irr, 2), "\n")
+```
+
+### SCCS
+
+První vakcína
+
+```{r}
+cl <- clients11 %>% 
+  filter(event_order == 1, year(presc_date) %in% c(2020, 2021), year(vacc_date) %in% c(2021)) %>% 
+  transmute(client_id, vacc_day = as.integer(vacc_date - minDate), presc_day = as.integer(presc_date - minDate), age, sex) %>% 
+  mutate(astart = 1, aend = 2*365, id = 1:n())
+
+result <- standardsccs(
+  formula = event ~ vacc_day,
+  indiv = id,
+  astart = astart,
+  aend = aend,
+  aevent = presc_day,
+  adrug = vacc_day,
+  aedrug = vacc_day + 365,
+  expogrp = list(c(0, 7, 14, 120, 280, 320, 365)),
+  data = cl
+)
+result
+```
+
+2. vakcína 
+
+```{r}
+cl <- clients11 %>% 
+  filter(event_order == 2, year(presc_date) %in% c(2020, 2021), year(vacc_date) %in% c(2021)) %>% 
+  transmute(client_id, vacc_day = as.integer(vacc_date - minDate), presc_day = as.integer(presc_date - minDate), age, sex) %>% 
+  mutate(astart = 1, aend = 2*365, id = 1:n())
+
+result <- standardsccs(
+  formula = event ~ vacc_day,
+  indiv = id,
+  astart = astart,
+  aend = aend,
+  aevent = presc_day,
+  adrug = vacc_day,
+  aedrug = vacc_day + 365,
+  expogrp = list(c(0, 7, 14, 120, 280, 320, 365)),
+  data = cl
+)
+result
+```
+
+3. vakcína 
+
+```{r}
+cl <- clients11 %>% 
+  filter(event_order == 3, year(presc_date) %in% c(2020, 2021, 2022), year(vacc_date) %in% c(2021, 2022)) %>% 
+  transmute(client_id, vacc_day = as.integer(vacc_date - minDate), presc_day = as.integer(presc_date - minDate), age, sex) %>% 
+  mutate(astart = 1, aend = 3*365, id = 1:n())
+
+result <- standardsccs(
+  formula = event ~ vacc_day,
+  indiv = id,
+  astart = astart,
+  aend = aend,
+  aevent = presc_day,
+  adrug = vacc_day,
+  aedrug = vacc_day + 365,
+  expogrp = list(c(0, 7, 14, 120, 280, 320, 365)),
+  data = cl
+)
+result
+```
