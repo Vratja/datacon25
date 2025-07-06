@@ -271,13 +271,14 @@ vaccinations <- dbGetQuery(con,
   left_join(age_cohorts, by = "age_class") %>%
   left_join(peak_dates, by = "cohort") %>%
   filter(between(date, decisive_date - days(14), decisive_date + days(14))) %>%
-  filter(ins_start_date < date - years(1), ins_end_date > date + years(1), cohort == "C") %>%
+  filter(ins_start_date < date - years(1), ins_end_date > date + years(1)) %>%
   transmute(
     person_id = client_id,
+    cohort,
     exposure_start_date = date,
     exposure_end_date = date + days(risk_days_after),
     observation_start_date = date - days(obs_days_before),
-    observation_end_date = date - days(obs_days_after)
+    observation_end_date = date + days(obs_days_after)
   )
 
 corticoids <- dbGetQuery(con,
@@ -296,70 +297,96 @@ corticoids <- dbGetQuery(con,
   left_join(age_cohorts, by = "age_class") %>%
   left_join(peak_dates, by = "cohort") %>%
   filter(between(date, decisive_date - days(365), decisive_date + days(365))) %>%
-  filter(ins_start_date < decisive_date - years(1), ins_end_date > decisive_date + years(1), cohort == "C") %>%
+  filter(ins_start_date < decisive_date - years(1), ins_end_date > decisive_date + years(1)) %>%
   transmute(person_id = client_id, event_date = date)
 
 sccs_data <- vaccinations %>%
-  left_join(corticoids, by = "person_id")
+  inner_join(corticoids, by = "person_id")
+
+sccs_data$prs_id <- as.integer(factor(sccs_data$person_id))
 
 sccs_data <- sccs_data %>%
-  mutate(across(c(event_date, exposure_start_date, exposure_end_date, observation_start_date, observation_end_date),
-                as.Date))
+  mutate(person_id = prs_id) %>%
+  select(-prs_id)
 
-# Calculate day offsets from observation start
 sccs_data <- sccs_data %>%
   mutate(
     event_day = as.integer(event_date - observation_start_date),
     exposure_start_day = as.integer(exposure_start_date - observation_start_date),
     exposure_end_day = as.integer(exposure_end_date - observation_start_date),
-    observation_start_day = 0,  # by definition
+    observation_start_day = 0,
     observation_end_day = as.integer(observation_end_date - observation_start_date)
   )
+```
 
-events_df <- sccs_data %>%
-  select(indiv = person_id, eventday = event_day) %>%
-  distinct()
+#### Cohort A SCCS ####
 
-exposures_df <- sccs_data %>%
-  select(indiv = person_id, start = exposure_start_day, end = exposure_end_day) %>%
-  distinct() %>%
-  mutate(exposure = "vaccine")
-
-# Observation period
-obs_df <- sccs_data %>%
-  select(indiv = person_id, start = observation_start_day, end = observation_end_day) %>%
-  distinct()
-
-# Create a data frame with all needed columns for standardsccs
-sccs_input_df <- obs_df %>%
-  select(indiv, start, end) %>%
-  left_join(
-    events_df %>% group_by(indiv) %>% summarise(eventday = list(eventday)),
-    by = "indiv"
-  ) %>%
-  left_join(
-    exposures_df %>%
-      group_by(indiv) %>%
-      summarise(
-        start_exp = list(start),
-        end_exp = list(end),
-        exposure = list(exposure)
-      ),
-    by = "indiv"
-  )
-
-# Now call standardsccs on this data frame, specifying the columns:
-sccs_data_formatted <- standardsccs(
-  data = sccs_input_df,
-  indiv = "indiv",
-  astart = "start",
-  aend = "end",
-  aevent = "eventday",
-  aedrug = c("start_exp", "end_exp", "exposure")
+```{r}
+sccs_result_A <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 280, 320, 365)),
+  data = filter(sccs_data, cohort == "A")
 )
 
-# Run model: risk during exposure vs baseline
-fit <- sccs(event ~ exposure, data = sccs_input)
+print(sccs_result_A)
+```
 
-summary(fit)
+#### Cohort B SCCS ####
+
+```{r}
+sccs_result_B <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 280, 320, 365)),
+  data = filter(sccs_data, cohort == "B")
+)
+
+print(sccs_result_B)
+```
+
+#### Cohort C SCCS ####
+
+```{r}
+sccs_result_C <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 280, 320, 365)),
+  data = filter(sccs_data, cohort == "C")
+)
+
+print(sccs_result_C)
+```
+
+#### Cohort D SCCS ####
+
+```{r}
+sccs_result_D <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 280, 320, 365)),
+  data = filter(sccs_data, cohort == "D")
+)
+
+print(sccs_result_D)
 ```
