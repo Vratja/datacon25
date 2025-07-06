@@ -18,38 +18,348 @@ library(DBI)
 library(ggplot2)
 library(tibble)
 library(tidyr)
+library(zoo)
+library(ggcorrplot)
+library(stats)
+library(pheatmap)
+library(viridisLite)
+library(SCCS)
 
 con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
 #dbDisconnect(con, shutdown = TRUE)
 ```
+#### Vaccination over time ####
 ```{r}
-vaccination_first_shot_overall <- dbGetQuery(con,
-                                "
+assign_age_class <- function(birthyear) {
+  age <- 2021 - birthyear
+  
+  cut(
+    age,
+    
+    breaks = c(-Inf, 4, 11, 15, 29, 34, 39, 44, 49, 54, 59, 64, 69, 79, Inf),
+    labels = c(
+      "<5",
+      "5-11",
+      "12-15",
+      "16-29",
+      "30-34",
+      "35-39",
+      "40-44",
+      "45-49",
+      "50-54",
+      "55-59",
+      "60-64",
+      "65-69",
+      "70-79",
+      "80+"
+    ),
+    right = TRUE,
+    ordered_result = TRUE
+  )
+}
+
+vaccination_first_shot_by_birthyear <- dbGetQuery(
+  con,
+  "
                                 SELECT DISTINCT
-                                date,
-                                COUNT(DISTINCT client_id) OVER (
-                                PARTITION BY date) AS vaccinated_total_in_day
-                                FROM ozp_vaccinations
-                                WHERE event_order = 1
-                                ")
+                                v.date,
+                                c.birthyear,
+                                COUNT(DISTINCT v.client_id) OVER (
+                                PARTITION BY v.date, c.birthyear) AS vaccinated_total_in_day
+                                FROM ozp_vaccinations v
+                                LEFT JOIN ozp_clients c ON v.client_id = c.client_id
+                                LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+                                WHERE
+                                v.event_order = 1
+                                AND i.ins_start_date < '2020-01-01' AND i.ins_end_date > '2023-01-01'
+                                "
+) %>%
+  mutate(age_class = assign_age_class(birthyear))
 
-total_population_count <- dbGetQuery(con,
+pop_by_age_class <- dbGetQuery(
+  con,
+  "
+                                     SELECT DISTINCT
+                                     birthyear,
+                                     COUNT(DISTINCT c.client_id) OVER (PARTITION BY c.birthyear) AS clients_count
+                                     FROM ozp_clients c
+                                     LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+                                     WHERE i.ins_start_date < '2020-01-01' AND i.ins_end_date > '2023-01-01'
                                      "
-                                     SELECT
-                                     COUNT(DISTINCT client_id)
-                                     FROM ozp_clients
-                                     ")[[1]]
+) %>%
+  mutate(age_class = assign_age_class(birthyear)) %>%
+  group_by(age_class) %>%
+  summarise(population = sum(clients_count, na.rm = TRUE),
+            .groups = "drop")
 
-vaccination_first_shot_cumulative <- vaccination_first_shot_overall %>%
-  arrange(date) %>%
-  mutate(vaccinated_ratio = cumsum(vaccinated_total_in_day) / total_population_count)
+vaccinated_first_shot_cumulative_ratio <- vaccination_first_shot_by_birthyear %>%
+  group_by(age_class, date) %>%
+  summarise(
+    vaccinated_in_day = sum(vaccinated_total_in_day, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(age_class, date) %>%
+  group_by(age_class) %>%
+  mutate(cumulative_vaccinated = cumsum(vaccinated_in_day)) %>%
+  ungroup() %>%
+  inner_join(pop_by_age_class, by = "age_class") %>%
+  mutate(vaccinated_ratio = cumulative_vaccinated / population)
 
-ggplot(vaccination_first_shot_cumulative, aes(x = date, y = vaccinated_ratio)) +
-  geom_line(color = "steelblue", linewidth = 1) +
+ggplot(vaccinated_first_shot_cumulative_ratio %>% 
+         filter(date <= as.Date("2022-01-01")), aes(x = date, y = vaccinated_ratio, color = age_class)) +
+  geom_line(size = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   labs(
-    title = "Vaccinated Ratio Over Time",
+    title = "Cumulative First-Dose Vaccination Ratio by Age Group",
     x = "Date",
-    y = "Vaccinated Ratio"
+    y = "Vaccinated (% of Age Group)",
+    color = "Age Class"
   ) +
   theme_minimal()
+
+vaccinated_weekly_smooth <- vaccinated_first_shot_cumulative_ratio %>%
+  arrange(age_class, date) %>%
+  group_by(age_class) %>%
+  mutate(vaccinated_7d_avg = zoo::rollmean(vaccinated_in_day / population, k = 7, fill = NA, align = "right")) %>%
+  ungroup()
+
+ggplot(vaccinated_weekly_smooth %>% 
+         filter(date <= as.Date("2022-01-01")), aes(x = date, y = vaccinated_7d_avg)) +
+  geom_line(color = "steelblue", size = 0.6) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ age_class, scales = "free_y") +
+  labs(
+    title = "Daily First-Dose Vaccinations by Age Group (Marginal, 7-day average)",
+    x = "Date",
+    y = "Vaccinated in Day"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+rm(vaccinated_weekly_smooth,
+   vaccination_first_shot_by_birthyear)
+
+vaccination_start_date <- pop_by_age_class %>%
+  select(age_class) %>%
+  arrange(desc(age_class)) %>%
+  mutate(vaccination_start_date =
+           as.Date(
+             c(
+               "2021-01-15",
+               "2021-03-01",
+               "2021-04-14",
+               "2021-04-23",
+               "2021-04-28",
+               "2021-05-05",
+               "2021-05-10",
+               "2021-05-17",
+               "2021-05-24",
+               "2021-05-26",
+               "2021-06-04",
+               "2021-07-01",
+               "2021-12-13",
+               NA
+             )
+           ))
+
+vaccination_cumulative_relative <- vaccinated_first_shot_cumulative_ratio %>%
+  left_join(vaccination_start_date, by = "age_class") %>%
+  mutate(days_prior_to_vaccination_start_date = as.integer(date - vaccination_start_date))
+
+vaccination_cumulative_relative %>%
+  filter(date <= as.Date("2022-01-01")) %>%
+  ggplot(aes(x = days_prior_to_vaccination_start_date, y = vaccinated_ratio, color = age_class)) +
+  geom_line(size = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Cumulative Vaccinated Ratio",
+    subtitle = "By Days since official eligibility for each age group",
+    x = "Days Since Group Eligibility",
+    y = "Vaccinated (% of Group)",
+    color = "Age Class"
+  ) +
+  theme_minimal(base_size = 13)
+
+wide_corr_data <- vaccination_cumulative_relative %>%
+  select(age_class, days_prior_to_vaccination_start_date, vaccinated_ratio) %>%
+  pivot_wider(
+    names_from = age_class,
+    values_from = vaccinated_ratio
+  )
+
+mat <- wide_corr_data %>% select(-days_prior_to_vaccination_start_date) %>% as.matrix()
+dist_mat <- dist(t(mat), method = "euclidean")
+dist_mat_full <- as.matrix(dist_mat)
+
+color_palette <- viridis(100)
+
+pheatmap(dist_mat_full,
+         color = color_palette,
+         display_numbers = TRUE,          
+         number_color = "black",
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize_number = 8,
+         fontsize = 10,
+         angle_col = 45,
+         main = "Euclidean Distance Between Vaccination Ratios Prior To Start Date by Age Group",
+         legend = TRUE,
+         legend_breaks = seq(0, max(dist_mat_full), length.out = 5),
+         legend_labels = round(seq(0, max(dist_mat_full), length.out = 5), 2),
+         border_color = "grey60"
+)
+```
+
+
+#### Define cohorts and decisive date by vaccination behaviour ####
+```{r}
+age_cohorts <- vaccination_start_date %>%
+  arrange(age_class) %>%
+  mutate(cohort = c(rep("A", 3), rep("B", 3), rep("C", 6), rep("D", 2)))
+
+vaccination_peaks <- vaccinated_first_shot_cumulative_ratio %>%
+  left_join(age_cohorts, by = "age_class") %>%
+  group_by(cohort, date) %>%
+  summarise(vaccinated_in_day = sum(vaccinated_in_day, na.rm = TRUE), .groups = "drop") %>%
+  arrange(cohort, date) %>%
+  group_by(cohort) %>%
+  mutate(vaccinated_in_day_ma7 = zoo::rollmean(vaccinated_in_day, k = 7, fill = NA, align = "right")) %>%
+  ungroup()
+
+peak_dates <- vaccination_peaks %>%
+  group_by(cohort) %>%
+  filter(vaccinated_in_day == max(vaccinated_in_day, na.rm = TRUE)) %>%
+  slice(1) %>% 
+  ungroup() %>%
+  select(cohort, peak_date = date) %>%
+  mutate(decisive_date = peak_date + days(7))
+  
+
+ggplot(vaccination_peaks, aes(x = date, y = vaccinated_in_day_ma7)) +
+  geom_line(color = "steelblue") +
+  facet_wrap(~ cohort, scales = "free_y") +
+  geom_vline(data = peak_dates, aes(xintercept = as.numeric(decisive_date)), color = "red", linetype = "dashed") +
+  labs(title = "7-Day Moving Average Vaccinations per Day by Cohort",
+       x = "Date", y = "Vaccinated in Day (7-day MA)") +
+  theme_minimal()
+```
+
+#### Prepare data for SCCS ####
+```{r}
+# Define observation window and risk window parameters
+obs_days_before <- 365
+obs_days_after <- 365
+risk_days_after <- 30
+
+vaccinations <- dbGetQuery(con,
+                           "
+                           SELECT
+                           v.client_id,
+                           v.date,
+                           c.birthyear,
+                           s.ins_start_date,
+                           s.ins_end_date,
+                           FROM ozp_vaccinations v
+                           LEFT JOIN ozp_clients c ON v.client_id = c.client_id
+                           LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                           WHERE v.event_order = 1
+                           ") %>%
+  mutate(age_class = assign_age_class(birthyear)) %>%
+  left_join(age_cohorts, by = "age_class") %>%
+  left_join(peak_dates, by = "cohort") %>%
+  filter(between(date, decisive_date - days(14), decisive_date + days(14))) %>%
+  filter(ins_start_date < date - years(1), ins_end_date > date + years(1), cohort == "C") %>%
+  transmute(
+    person_id = client_id,
+    exposure_start_date = date,
+    exposure_end_date = date + days(risk_days_after),
+    observation_start_date = date - days(obs_days_before),
+    observation_end_date = date - days(obs_days_after)
+  )
+
+corticoids <- dbGetQuery(con,
+                          "
+                           SELECT
+                           v.client_id,
+                           v.date,
+                           c.birthyear,
+                           s.ins_start_date,
+                           s.ins_end_date,
+                           FROM ozp_prescriptions v
+                           LEFT JOIN ozp_clients c ON v.client_id = c.client_id
+                           LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                         ") %>%
+  mutate(age_class = assign_age_class(birthyear)) %>%
+  left_join(age_cohorts, by = "age_class") %>%
+  left_join(peak_dates, by = "cohort") %>%
+  filter(between(date, decisive_date - days(365), decisive_date + days(365))) %>%
+  filter(ins_start_date < decisive_date - years(1), ins_end_date > decisive_date + years(1), cohort == "C") %>%
+  transmute(person_id = client_id, event_date = date)
+
+sccs_data <- vaccinations %>%
+  left_join(corticoids, by = "person_id")
+
+sccs_data <- sccs_data %>%
+  mutate(across(c(event_date, exposure_start_date, exposure_end_date, observation_start_date, observation_end_date),
+                as.Date))
+
+# Calculate day offsets from observation start
+sccs_data <- sccs_data %>%
+  mutate(
+    event_day = as.integer(event_date - observation_start_date),
+    exposure_start_day = as.integer(exposure_start_date - observation_start_date),
+    exposure_end_day = as.integer(exposure_end_date - observation_start_date),
+    observation_start_day = 0,  # by definition
+    observation_end_day = as.integer(observation_end_date - observation_start_date)
+  )
+
+events_df <- sccs_data %>%
+  select(indiv = person_id, eventday = event_day) %>%
+  distinct()
+
+exposures_df <- sccs_data %>%
+  select(indiv = person_id, start = exposure_start_day, end = exposure_end_day) %>%
+  distinct() %>%
+  mutate(exposure = "vaccine")
+
+# Observation period
+obs_df <- sccs_data %>%
+  select(indiv = person_id, start = observation_start_day, end = observation_end_day) %>%
+  distinct()
+
+# Create a data frame with all needed columns for standardsccs
+sccs_input_df <- obs_df %>%
+  select(indiv, start, end) %>%
+  left_join(
+    events_df %>% group_by(indiv) %>% summarise(eventday = list(eventday)),
+    by = "indiv"
+  ) %>%
+  left_join(
+    exposures_df %>%
+      group_by(indiv) %>%
+      summarise(
+        start_exp = list(start),
+        end_exp = list(end),
+        exposure = list(exposure)
+      ),
+    by = "indiv"
+  )
+
+# Now call standardsccs on this data frame, specifying the columns:
+sccs_data_formatted <- standardsccs(
+  data = sccs_input_df,
+  indiv = "indiv",
+  astart = "start",
+  aend = "end",
+  aevent = "eventday",
+  aedrug = c("start_exp", "end_exp", "exposure")
+)
+
+# Run model: risk during exposure vs baseline
+fit <- sccs(event ~ exposure, data = sccs_input)
+
+summary(fit)
 ```
