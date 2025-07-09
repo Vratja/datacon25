@@ -108,7 +108,7 @@ cl <- clients11 %>%
   mutate(astart = 1, aend = 2*365, id = 1:n())
 
 # Definujeme rizikové období: 0–14 dní po očkování
-riskInt = 5
+riskInt = 14
 is_risk_period <- (cl$presc_day >= cl$vacc_day) & (cl$presc_day <= cl$vacc_day + riskInt)
 
 # Vytvoříme datový rámec
@@ -129,7 +129,7 @@ total_followup_days <- 2*365
 n_risk <- sum(df$is_risk_period)
 n_total <- nrow(df)
 n_control <- n_total - n_risk
-n <- cl100$client_id %>% unique() %>% length()
+n <- cl$client_id %>% unique() %>% length()
 
 # Časová expozice (součet dnů ve všech obdobích)
 exposure_risk <- n * risk_period_days
