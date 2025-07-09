@@ -390,3 +390,188 @@ sccs_result_D <- standardsccs(
 
 print(sccs_result_D)
 ```
+
+#### Age distributions over time ####
+
+```{r}
+prescriptions <- dbGetQuery(
+  con,
+  "
+    SELECT
+      c.client_id,
+      c.sex,
+      c.birthyear,
+      DATE_TRUNC('month', p.date) AS yearmonth,
+      c.n_vacc
+    FROM ozp_clients c
+    LEFT JOIN ozp_prescriptions p ON c.client_id = p.client_id
+    LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+    WHERE p.date IS NOT NULL
+    AND i.ins_end_date IS NULL AND ins_start_date <= '2015-01-01'
+  "
+) %>%
+  mutate(age = year(yearmonth) - birthyear) %>%
+  mutate(age_group = case_when(
+    age < 5 ~ "<5",
+    age >= 5 & age <= 11 ~ "5-11",
+    age >= 12 & age <= 15 ~ "12-15",
+    age >= 16 & age <= 29 ~ "16-29",
+    age >= 30 & age <= 34 ~ "30-34",
+    age >= 35 & age <= 39 ~ "35-39",
+    age >= 40 & age <= 44 ~ "40-44",
+    age >= 45 & age <= 49 ~ "45-49",
+    age >= 50 & age <= 54 ~ "50-54",
+    age >= 55 & age <= 59 ~ "55-59",
+    age >= 60 & age <= 64 ~ "60-64",
+    age >= 65 & age <= 69 ~ "65-69",
+    age >= 70 & age <= 79 ~ "70-79",
+    age >= 80 ~ "80+",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(cohort = case_when(
+    age >= 5 & age <= 15 ~ "A (5–15)",
+    age >= 16 & age <= 39 ~ "B (16–39)",
+    age >= 40 & age <= 69 ~ "C (40–69)",
+    age >= 70 ~ "D (70+)",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(vaccinated = ifelse(n_vacc > 0, "1", "0"))
+
+year_starts <- seq(
+  floor_date(min(monthly_counts$yearmonth, na.rm = TRUE), "year"),
+  ceiling_date(max(monthly_counts$yearmonth, na.rm = TRUE), "year"),
+  by = "1 year"
+)
+
+monthly_counts <- prescriptions %>%
+  group_by(yearmonth) %>%
+  summarise(prescriptions = n()) %>%
+  arrange(yearmonth)
+
+ggplot(monthly_counts, aes(x = yearmonth, y = prescriptions)) +
+  geom_vline(xintercept = as.numeric(year_starts), linetype = "dotted", color = "gray70", linewidth = 0.4) +
+  geom_line(color = "steelblue", linewidth = 1, alpha = 0.6) +
+  stat_smooth(method = "loess", span = 0.3, color = "darkorange", se = TRUE, linewidth = 1.2) +
+  scale_x_date(
+    date_labels = "%Y",             
+    date_breaks = "1 year",         
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  labs(
+    title = "Number of Prescriptions by Month",
+    x = "Year",
+    y = "Number of Prescriptions"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(color = "black", size = 12, face = "bold"),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5)
+  )
+
+monthly_counts_vacc <- prescriptions %>%
+  group_by(yearmonth, vaccinated) %>%
+  summarise(prescriptions = n()) %>%
+  arrange(yearmonth)
+
+ggplot(monthly_counts_vacc, aes(x = yearmonth, y = prescriptions)) +
+  geom_vline(xintercept = as.numeric(year_starts), linetype = "dotted", color = "gray70", linewidth = 0.4) +
+  geom_line(color = "steelblue", linewidth = 1, alpha = 0.6) +
+  stat_smooth(method = "loess", span = 0.3, se = TRUE, color = "darkorange", linewidth = 1.2) +
+  scale_x_date(
+    date_labels = "%Y",             
+    date_breaks = "1 year",         
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  labs(
+    title = "Number of Prescriptions by Month and Vaccination Status",
+    x = "Year",
+    y = "Number of Prescriptions"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(color = "black", size = 12, face = "bold"),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5)
+  ) +
+  facet_wrap(~ vaccinated, ncol = 1, , scales = "free_y")
+
+avg_age_over_time <- prescriptions %>%
+  group_by(yearmonth) %>%
+  summarise(avg_age = mean(age, na.rm = TRUE)) %>%
+  arrange(yearmonth)
+
+ggplot(avg_age_over_time, aes(x = yearmonth, y = avg_age)) +
+  geom_vline(xintercept = as.numeric(year_starts), linetype = "dotted", color = "gray70", linewidth = 0.4) +
+  geom_line(color = "steelblue", linewidth = 1, alpha = 0.6) +
+  stat_smooth(method = "loess", span = 0.3, se = TRUE, linewidth = 1.5, color = "darkorange") +
+  scale_x_date(
+    date_labels = "%Y",
+    date_breaks = "1 year",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  labs(
+    title = "Average Age of Clients with Prescriptions Over Time",
+    x = "Year",
+    y = "Average Age"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(color = "black", size = 12, face = "bold"),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5)
+  )
+
+monthly_age_counts <- prescriptions %>%
+  filter(!is.na(age_group)) %>%
+  group_by(yearmonth, age_group) %>%
+  summarise(prescriptions = n(), .groups = "drop") %>%
+  arrange(yearmonth)
+
+ggplot(monthly_age_counts, aes(x = yearmonth, y = prescriptions, color = age_group)) +
+  geom_vline(xintercept = as.numeric(year_starts), linetype = "dotted", color = "gray70", linewidth = 0.4) +
+  geom_line(linewidth = 0.5, alpha = 0.4) +
+  stat_smooth(method = "loess", span = 0.3, se = FALSE, linewidth = 1, alpha = 1) +
+  scale_x_date(
+    date_labels = "%Y",
+    date_breaks = "1 year",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_color_viridis_d(option = "viridis", name = "Age Class", end = 0.9) +
+  labs(
+    title = "Monthly Prescriptions by Age Class",
+    x = "Year",
+    y = "Number of Prescriptions"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(color = "gray20", size = 12, face = "bold"),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    legend.position = "right"
+  )
+
+monthly_cohort_counts <- prescriptions %>%
+  filter(!is.na(cohort)) %>%
+  group_by(yearmonth, cohort) %>%
+  summarise(prescriptions = n(), .groups = "drop") %>%
+  arrange(yearmonth)
+
+ggplot(monthly_cohort_counts, aes(x = yearmonth, y = prescriptions, color = cohort)) +
+  geom_vline(xintercept = as.numeric(year_starts), linetype = "dotted", color = "gray70", linewidth = 0.4) +
+  geom_line(linewidth = 0.6, alpha = 0.4) + 
+  stat_smooth(method = "loess", span = 0.3, se = FALSE, linewidth = 1.5) +
+  scale_x_date(
+    date_labels = "%Y",
+    date_breaks = "1 year",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_color_viridis_d(option = "viridis", name = "Cohort") +
+  labs(
+    title = "Monthly Prescriptions by Age Cohort",
+    x = "Year",
+    y = "Number of Prescriptions"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    legend.position = "right"
+  )
+```
