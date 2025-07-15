@@ -111,7 +111,9 @@ age_tbl
 
 
 ```{r fig.height=8}
-df_summary <- tbl(con, "ozp_prescriptions") %>% 
+df_summary <- tbl(con, "ozp_prescriptions") %>%
+  left_join(tbl(con,"ozp_ins_start_end")) %>%
+  filter(!is.na(ins_end_date) & ins_start_date < '2015-01-01') %>%
   left_join(
     tbl(con, "ozp_clients") %>% mutate(age_gr = ntile(age, 5)) %>% select(client_id, age_gr), by = "client_id"
   ) %>% 

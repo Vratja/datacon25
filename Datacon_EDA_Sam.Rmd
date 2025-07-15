@@ -24,6 +24,7 @@ library(stats)
 library(pheatmap)
 library(viridisLite)
 library(SCCS)
+library(broom)
 
 con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
 #dbDisconnect(con, shutdown = TRUE)
@@ -262,9 +263,9 @@ vaccinations <- dbGetQuery(con,
                            c.birthyear,
                            s.ins_start_date,
                            s.ins_end_date,
-                           FROM ozp_vaccinations v
-                           LEFT JOIN ozp_clients c ON v.client_id = c.client_id
-                           LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                           FROM cpzp_vaccinations v
+                           LEFT JOIN cpzp_clients c ON v.client_id = c.client_id
+                           LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
                            WHERE v.event_order = 1
                            ") %>%
   mutate(age_class = assign_age_class(birthyear)) %>%
@@ -289,9 +290,10 @@ corticoids <- dbGetQuery(con,
                            c.birthyear,
                            s.ins_start_date,
                            s.ins_end_date,
-                           FROM ozp_prescriptions v
-                           LEFT JOIN ozp_clients c ON v.client_id = c.client_id
-                           LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                           FROM cpzp_prescriptions v
+                           LEFT JOIN cpzp_clients c ON v.client_id = c.client_id
+                           LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
+                           WHERE v.presc_order = 1
                          ") %>%
   mutate(age_class = assign_age_class(birthyear)) %>%
   left_join(age_cohorts, by = "age_class") %>%
@@ -396,18 +398,20 @@ print(sccs_result_D)
 ```{r}
 prescriptions <- dbGetQuery(
   con,
-  "
-    SELECT
+  "SELECT
       c.client_id,
       c.sex,
       c.birthyear,
       DATE_TRUNC('month', p.date) AS yearmonth,
       c.n_vacc
-    FROM ozp_clients c
-    LEFT JOIN ozp_prescriptions p ON c.client_id = p.client_id
-    LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+    FROM cpzp_clients c
+    JOIN cpzp_prescriptions p ON c.client_id = p.client_id
+    JOIN cpzp_ins_start_end i ON c.client_id = i.client_id
     WHERE p.date IS NOT NULL
-    AND i.ins_end_date IS NULL AND ins_start_date <= '2015-01-01'
+    AND i.ins_end_date = '9999-12-31' AND i.ins_start_date <= '2015-01-01'
+    AND p.presc_order = 1
+    AND p.date > '2018-01-01'
+
   "
 ) %>%
   mutate(age = year(yearmonth) - birthyear) %>%
@@ -437,16 +441,16 @@ prescriptions <- dbGetQuery(
   )) %>%
   mutate(vaccinated = ifelse(n_vacc > 0, "1", "0"))
 
+monthly_counts <- prescriptions %>%
+  group_by(yearmonth) %>%
+  summarise(prescriptions = n()) %>%
+  arrange(yearmonth)
+
 year_starts <- seq(
   floor_date(min(monthly_counts$yearmonth, na.rm = TRUE), "year"),
   ceiling_date(max(monthly_counts$yearmonth, na.rm = TRUE), "year"),
   by = "1 year"
 )
-
-monthly_counts <- prescriptions %>%
-  group_by(yearmonth) %>%
-  summarise(prescriptions = n()) %>%
-  arrange(yearmonth)
 
 ggplot(monthly_counts, aes(x = yearmonth, y = prescriptions)) +
   geom_vline(xintercept = as.numeric(year_starts), linetype = "dotted", color = "gray70", linewidth = 0.4) +
@@ -574,4 +578,574 @@ ggplot(monthly_cohort_counts, aes(x = yearmonth, y = prescriptions, color = coho
     axis.text.x = element_text(size = 12, face = "bold"),
     legend.position = "right"
   )
+```
+
+#### Effect of incidence on corticoidsteroid prescriptions ####
+```{r}
+incidence_daily <- dbGetQuery(con,
+                              "
+                              SELECT
+                              *
+                              FROM
+                              covid_incidence
+                              ")
+
+prescriptions_daily <- prescriptions <- dbGetQuery(
+  con,
+  "SELECT
+      c.client_id,
+      c.sex,
+      c.birthyear,
+      p.date,
+      c.n_vacc
+    FROM cpzp_clients c
+    JOIN cpzp_prescriptions p ON c.client_id = p.client_id
+    JOIN cpzp_ins_start_end i ON c.client_id = i.client_id
+    WHERE p.date IS NOT NULL
+    AND i.ins_end_date = '9999-12-31' AND i.ins_start_date <= '2015-01-01'
+    AND p.date >= '2020-03-01' AND p.date <= '2023-01-01'
+    AND p.presc_order = 1
+
+  "
+) %>%
+  mutate(age = year(date) - birthyear) %>%
+  mutate(age_group = case_when(
+    age < 5 ~ "<5",
+    age >= 5 & age <= 11 ~ "5-11",
+    age >= 12 & age <= 15 ~ "12-15",
+    age >= 16 & age <= 29 ~ "16-29",
+    age >= 30 & age <= 34 ~ "30-34",
+    age >= 35 & age <= 39 ~ "35-39",
+    age >= 40 & age <= 44 ~ "40-44",
+    age >= 45 & age <= 49 ~ "45-49",
+    age >= 50 & age <= 54 ~ "50-54",
+    age >= 55 & age <= 59 ~ "55-59",
+    age >= 60 & age <= 64 ~ "60-64",
+    age >= 65 & age <= 69 ~ "65-69",
+    age >= 70 & age <= 79 ~ "70-79",
+    age >= 80 ~ "80+",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(cohort = case_when(
+    age >= 5 & age <= 15 ~ "A (5–15)",
+    age >= 16 & age <= 39 ~ "B (16–39)",
+    age >= 40 & age <= 69 ~ "C (40–69)",
+    age >= 70 ~ "D (70+)",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(vaccinated = ifelse(n_vacc > 0, "1", "0"))
+
+prescriptions_counts <- prescriptions_daily %>%
+  group_by(date) %>%
+  summarise(daily_count = n(), .groups = "drop") %>%
+  arrange(date) %>%
+  mutate(
+    prescription_count = rollapply(
+      data = daily_count,
+      width = 7,
+      align = "right",
+      FUN = sum,
+      fill = NA,
+      na.rm = TRUE
+    )
+  )
+
+incidence_prescriptions <- prescriptions_counts %>%
+  inner_join(incidence_daily, by = "date")
+
+max_lag <- 365
+
+for (i in 0:max_lag) {
+  incidence_prescriptions[[paste0("lag_", i)]] <- lag(incidence_prescriptions$incidence_7, i)
+}
+
+results <- data.frame(lag = 0:max_lag, r_squared = NA)
+
+for (i in 0:max_lag) {
+  model <- lm(prescription_count ~ incidence_prescriptions[[paste0("lag_", i)]], data = incidence_prescriptions)
+  results$r_squared[i + 1] <- summary(model)$r.squared
+}
+
+ggplot(results, aes(x = lag, y = r_squared)) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  geom_point() +
+  labs(
+    title = "R² by lagged COVID-19 incidence",
+    x = "Lag in days",
+    y = "R²"
+  ) +
+  theme_minimal()
+
+cor.test(incidence_prescriptions$prescription_count, incidence_prescriptions$lag_100, use = "complete.obs")
+model_100 <- lm(prescription_count ~ lag_100, data = incidence_prescriptions)
+summary(model_100)
+
+ggplot(incidence_prescriptions, aes(x = date)) +
+  geom_line(aes(y = prescription_count), color = "blue", size = 1) +
+  geom_line(aes(y = lag_100), color = "red", size = 1, linetype = "dashed") +
+  labs(
+    title = "Daily Prescription Count vs 100-day Lagged COVID-19 Incidence",
+    subtitle = "Blue: Prescription Count | Red (dashed): Scaled COVID-19 Incidence (×10)",
+    x = "Date",
+    y = "Prescription Count / Scaled Incidence"
+  ) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 months") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(incidence_prescriptions, aes(x = lag_100, y = prescription_count)) +
+  geom_point(alpha = 0.6, color = "darkblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linewidth = 1) +
+  labs(
+    title = "Daily Prescriptions vs 100-day Lagged COVID-19 Incidence",
+    x = "COVID-19 Incidence (100-day lag, per 100k)",
+    y = "Prescription Count"
+  ) +
+  theme_minimal()
+```
+
+#### SCCS Comparison first-presc####
+```{r}
+combined_vaccinated_prescribed <- dbGetQuery(con,
+                                    "
+                                    SELECT
+                                    v.client_id,
+                                    v.date AS vaccination_date,
+                                    p.date AS event_date,
+                                    'CPZP' as ins_company
+                                    FROM cpzp_vaccinations v
+                                    LEFT JOIN cpzp_clients c ON v.client_id = c.client_id
+                                    LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
+                                    INNER JOIN cpzp_prescriptions p ON c.client_id = p.client_id
+                                                                    AND p.presc_order = 1
+                                                                    AND p.date BETWEEN v.date - INTERVAL '1 year' AND v.date + INTERVAL '1 year'
+                                    WHERE v.event_order = 1
+                                    AND s.ins_start_date < v.date - INTERVAL '1 year'
+                                    AND s.ins_end_date > v.date + INTERVAL '1 year'
+                                    AND v.date BETWEEN DATE '2021-06-07' - INTERVAL '7 days'
+                                                       AND DATE '2021-06-07' + INTERVAL '7 days'
+                                    AND 2021 - c.birthyear BETWEEN 16 AND 39
+                                    
+                                    UNION
+                                    
+                                    SELECT
+                                    v.client_id,
+                                    v.date AS vaccination_date,
+                                    p.date AS event_date,
+                                    'OZP' AS ins_company
+                                    FROM OZP_vaccinations v
+                                    LEFT JOIN ozp_clients c ON v.client_id = c.client_id
+                                    LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                                    INNER JOIN ozp_prescriptions p ON c.client_id = p.client_id
+                                                                    AND p.presc_order = 1
+                                                                    AND p.date BETWEEN v.date - INTERVAL '1 year' AND v.date + INTERVAL '1 year'
+                                    WHERE v.event_order = 1
+                                    AND s.ins_start_date < v.date - INTERVAL '1 year'
+                                    AND s.ins_end_date > v.date + INTERVAL '1 year'
+                                    AND v.date BETWEEN DATE '2021-06-07' - INTERVAL '7 days'
+                                                       AND DATE '2021-06-07' + INTERVAL '7 days'
+                                    AND 2021 - c.birthyear BETWEEN 16 AND 39
+                                    ") %>%
+  mutate(client_id = row_number()) %>%
+  transmute(
+    person_id = client_id,
+    exposure_start_date = vaccination_date,
+    event_date,
+    observation_start_date = vaccination_date - days(365),
+    observation_end_date = vaccination_date + days(365)
+  )
+
+sccs_vaccinated <- combined_vaccinated_prescribed %>%
+  mutate(
+    event_day = as.integer(event_date - observation_start_date),
+    exposure_start_day = as.integer(exposure_start_date - observation_start_date),
+    observation_start_day = 0,
+    observation_end_day = as.integer(observation_end_date - observation_start_date)
+  )
+
+sccs_result_vaccinated <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 90, 180, 270)),
+  data = sccs_vaccinated
+)
+
+print(sccs_result_vaccinated)
+
+combined_unvaccinated_prescribed <- dbGetQuery(con,
+                                               "
+                                    SELECT
+                                    p.client_id,
+                                    DATE '2021-06-07' AS vaccination_date,
+                                    p.date AS event_date,
+                                    'CPZP' as ins_company
+                                    FROM cpzp_prescriptions p
+                                    LEFT JOIN cpzp_clients c ON P.client_id = c.client_id 
+                                    LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
+                                    WHERE 1 = 1
+                                    AND s.ins_start_date < DATE '2021-06-07' - INTERVAL '1 year'
+                                    AND s.ins_end_date > DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND 2021 - c.birthyear BETWEEN 16 AND 39
+                                    AND p.date BETWEEN DATE '2021-06-07' - INTERVAL '1 year' AND DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND p.presc_order = 1
+                                    AND c.n_vacc = 0
+                                    
+                                    UNION
+                                    
+                                    SELECT
+                                    p.client_id,
+                                    DATE '2021-06-07' AS vaccination_date,
+                                    p.date AS event_date,
+                                    'OZP' as ins_company
+                                    FROM ozp_prescriptions p
+                                    LEFT JOIN ozp_clients c ON P.client_id = c.client_id 
+                                    LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                                    WHERE 1 = 1
+                                    AND s.ins_start_date < DATE '2021-06-07' - INTERVAL '1 year'
+                                    AND s.ins_end_date > DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND 2021 - c.birthyear BETWEEN 16 AND 39
+                                    AND p.date BETWEEN DATE '2021-06-07' - INTERVAL '1 year' AND DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND p.presc_order = 1
+                                    AND c.n_vacc = 0
+
+                                               ") %>%
+  mutate(client_id = row_number()) %>%
+  transmute(
+    person_id = client_id,
+    exposure_start_date = vaccination_date,
+    event_date,
+    observation_start_date = vaccination_date - days(365),
+    observation_end_date = vaccination_date + days(365)
+  )
+
+sccs_unvaccinated <- combined_unvaccinated_prescribed %>%
+  mutate(
+    event_day = as.integer(event_date - observation_start_date),
+    exposure_start_day = as.integer(exposure_start_date - observation_start_date),
+    observation_start_day = 0,
+    observation_end_day = as.integer(observation_end_date - observation_start_date)
+  )
+
+sccs_result_unvaccinated <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 90, 180, 270)),
+  data = sccs_unvaccinated
+)
+
+print(sccs_result_unvaccinated)
+
+
+coef_unvax <- sccs_result_unvaccinated$coefficients
+conf_unvax <- sccs_result_unvaccinated$conf.int
+
+df_unvax <- data.frame(
+  term = rownames(coef_unvax),
+  logHR = coef_unvax[, "coef"],
+  SE = coef_unvax[, "se(coef)"],
+  HR = coef_unvax[, "exp(coef)"],
+  conf.low = conf_unvax[, "lower .95"],
+  conf.high = conf_unvax[, "upper .95"]
+)
+
+coef_vax <- sccs_result_vaccinated$coefficients
+conf_vax <- sccs_result_vaccinated$conf.int
+
+df_vax <- data.frame(
+  term = rownames(coef_vax),
+  logHR = coef_vax[, "coef"],
+  SE = coef_vax[, "se(coef)"],
+  HR = coef_vax[, "exp(coef)"],
+  conf.low = conf_vax[, "lower .95"],
+  conf.high = conf_vax[, "upper .95"]
+)
+
+df_unvax <- df_unvax %>% mutate(group = "Unvaccinated")
+df_vax <- df_vax %>% mutate(group = "Vaccinated")
+
+combined <- bind_rows(df_vax, df_unvax)
+
+combined$period <- as.integer(gsub("exposure_start_day", "", combined$term))
+
+start_days <- c(0, 14, 28, 60, 90, 180, 270)
+end_days   <- c(13, 27, 59, 89, 179, 269, Inf)
+
+period_labels <- paste0(start_days, "-", ifelse(is.infinite(end_days), "+", end_days))
+
+combined$period_label <- factor(combined$period,
+                                levels = seq_along(period_labels),
+                                labels = period_labels)
+
+ggplot(combined, aes(x = period_label, y = HR, color = group)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2,
+                position = position_dodge(width = 0.6)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(
+    x = "Exposure Period (days)",
+    y = "Hazard Ratio (HR)",
+    title = "SCCS Vaccinated vs Unvaccinated Comparison"
+  ) +
+  theme_minimal()
+
+vax_df <- combined %>%
+  filter(group == "Vaccinated") %>%
+  rename_with(~ paste0(., "_vax"), -c(period, period_label))
+
+unvax_df <- combined %>%
+  filter(group == "Unvaccinated") %>%
+  rename_with(~ paste0(., "_unvax"), -c(period, period_label))
+
+df_diff <- inner_join(vax_df, unvax_df, by = c("period", "period_label"))
+
+df_diff <- df_diff %>%
+  mutate(
+    logHR_diff = logHR_vax - logHR_unvax,
+    se_diff = sqrt(SE_vax^2 + SE_unvax^2),
+    ci_low = logHR_diff - 1.96 * se_diff,
+    ci_high = logHR_diff + 1.96 * se_diff
+  )
+
+ggplot(df_diff, aes(x = period_label, y = logHR_diff)) +
+  geom_point(color = "blue", size = 3) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2, color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Difference in log(Hazard Ratio) (Vaccinated - Unvaccinated)",
+    x = "Exposure Period",
+    y = "Difference in log(Hazard Ratio)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+#### SCCS Comparison all prescriptions####
+```{r}
+combined_vaccinated_prescribed <- dbGetQuery(con,
+                                    "
+                                    SELECT
+                                    v.client_id,
+                                    v.date AS vaccination_date,
+                                    p.date AS event_date,
+                                    'CPZP' as ins_company
+                                    FROM cpzp_vaccinations v
+                                    LEFT JOIN cpzp_clients c ON v.client_id = c.client_id
+                                    LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
+                                    INNER JOIN cpzp_prescriptions p ON c.client_id = p.client_id
+                                                                    AND p.date BETWEEN v.date - INTERVAL '1 year' AND v.date + INTERVAL '1 year'
+                                    WHERE v.event_order = 1
+                                    AND s.ins_start_date < v.date - INTERVAL '1 year'
+                                    AND s.ins_end_date > v.date + INTERVAL '1 year'
+                                    AND v.date BETWEEN DATE '2021-06-07' - INTERVAL '7 days'
+                                                       AND DATE '2021-06-07' + INTERVAL '7 days'
+                                    AND 2021 - c.birthyear BETWEEN 16 AND 39
+                                    
+                                    UNION
+                                    
+                                    SELECT
+                                    v.client_id,
+                                    v.date AS vaccination_date,
+                                    p.date AS event_date,
+                                    'OZP' AS ins_company
+                                    FROM OZP_vaccinations v
+                                    LEFT JOIN ozp_clients c ON v.client_id = c.client_id
+                                    LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                                    INNER JOIN ozp_prescriptions p ON c.client_id = p.client_id
+                                                                    AND p.date BETWEEN v.date - INTERVAL '1 year' AND v.date + INTERVAL '1 year'
+                                    WHERE v.event_order = 1
+                                    AND s.ins_start_date < v.date - INTERVAL '1 year'
+                                    AND s.ins_end_date > v.date + INTERVAL '1 year'
+                                    AND v.date BETWEEN DATE '2021-06-07' - INTERVAL '7 days'
+                                                       AND DATE '2021-06-07' + INTERVAL '7 days'
+                                    AND 2021 - c.birthyear BETWEEN 16 AND 39
+                                    ") %>%
+  mutate(client_id = as.numeric(factor(client_id))) %>%
+  transmute(
+    person_id = client_id,
+    exposure_start_date = vaccination_date,
+    event_date,
+    observation_start_date = vaccination_date - days(365),
+    observation_end_date = vaccination_date + days(365)
+  )
+
+sccs_vaccinated <- combined_vaccinated_prescribed %>%
+  mutate(
+    event_day = as.integer(event_date - observation_start_date),
+    exposure_start_day = as.integer(exposure_start_date - observation_start_date),
+    observation_start_day = 0,
+    observation_end_day = as.integer(observation_end_date - observation_start_date)
+  )
+
+sccs_result_vaccinated <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 90, 180, 270)),
+  data = sccs_vaccinated
+)
+
+print(sccs_result_vaccinated)
+
+combined_unvaccinated_prescribed <- dbGetQuery(con,
+                                               "
+                                    SELECT
+                                    p.client_id,
+                                    DATE '2021-06-07' AS vaccination_date,
+                                    p.date AS event_date,
+                                    'CPZP' as ins_company
+                                    FROM cpzp_prescriptions p
+                                    LEFT JOIN cpzp_clients c ON P.client_id = c.client_id 
+                                    LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
+                                    WHERE 1 = 1
+                                    AND s.ins_start_date < DATE '2021-06-07' - INTERVAL '1 year'
+                                    AND s.ins_end_date > DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND 2021 - c.birthyear BETWEEN 16 AND 39
+                                    AND p.date BETWEEN DATE '2021-06-07' - INTERVAL '1 year' AND DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND c.n_vacc = 0
+                                    
+                                    UNION
+                                    
+                                    SELECT
+                                    p.client_id,
+                                    DATE '2021-06-07' AS vaccination_date,
+                                    p.date AS event_date,
+                                    'OZP' as ins_company
+                                    FROM ozp_prescriptions p
+                                    LEFT JOIN ozp_clients c ON P.client_id = c.client_id 
+                                    LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                                    WHERE 1 = 1
+                                    AND s.ins_start_date < DATE '2021-06-07' - INTERVAL '1 year'
+                                    AND s.ins_end_date > DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND 2021 - c.birthyear BETWEEN 16 AND 39
+                                    AND p.date BETWEEN DATE '2021-06-07' - INTERVAL '1 year' AND DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND c.n_vacc = 0
+
+                                               ") %>%
+  mutate(client_id = as.numeric(factor(client_id))) %>%
+  transmute(
+    person_id = client_id,
+    exposure_start_date = vaccination_date,
+    event_date,
+    observation_start_date = vaccination_date - days(365),
+    observation_end_date = vaccination_date + days(365)
+  )
+
+sccs_unvaccinated <- combined_unvaccinated_prescribed %>%
+  mutate(
+    event_day = as.integer(event_date - observation_start_date),
+    exposure_start_day = as.integer(exposure_start_date - observation_start_date),
+    observation_start_day = 0,
+    observation_end_day = as.integer(observation_end_date - observation_start_date)
+  )
+
+sccs_result_unvaccinated <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 90, 180, 270)),
+  data = sccs_unvaccinated
+)
+
+print(sccs_result_unvaccinated)
+
+
+coef_unvax <- sccs_result_unvaccinated$coefficients
+conf_unvax <- sccs_result_unvaccinated$conf.int
+
+df_unvax <- data.frame(
+  term = rownames(coef_unvax),
+  logHR = coef_unvax[, "coef"],
+  SE = coef_unvax[, "se(coef)"],
+  HR = coef_unvax[, "exp(coef)"],
+  conf.low = conf_unvax[, "lower .95"],
+  conf.high = conf_unvax[, "upper .95"]
+)
+
+coef_vax <- sccs_result_vaccinated$coefficients
+conf_vax <- sccs_result_vaccinated$conf.int
+
+df_vax <- data.frame(
+  term = rownames(coef_vax),
+  logHR = coef_vax[, "coef"],
+  SE = coef_vax[, "se(coef)"],
+  HR = coef_vax[, "exp(coef)"],
+  conf.low = conf_vax[, "lower .95"],
+  conf.high = conf_vax[, "upper .95"]
+)
+
+df_unvax <- df_unvax %>% mutate(group = "Unvaccinated")
+df_vax <- df_vax %>% mutate(group = "Vaccinated")
+
+combined <- bind_rows(df_vax, df_unvax)
+
+combined$period <- as.integer(gsub("exposure_start_day", "", combined$term))
+
+start_days <- c(0, 14, 28, 60, 90, 180, 270)
+end_days   <- c(13, 27, 59, 89, 179, 269, Inf)
+
+period_labels <- paste0(start_days, "-", ifelse(is.infinite(end_days), "+", end_days))
+
+combined$period_label <- factor(combined$period,
+                                levels = seq_along(period_labels),
+                                labels = period_labels)
+
+ggplot(combined, aes(x = period_label, y = HR, color = group)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2,
+                position = position_dodge(width = 0.6)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(
+    x = "Cumulative Exposure Period (days)",
+    y = "Hazard Ratio (HR)",
+    title = "SCCS Vaccinated vs Unvaccinated Comparison"
+  ) +
+  theme_minimal()
+
+vax_df <- combined %>%
+  filter(group == "Vaccinated") %>%
+  rename_with(~ paste0(., "_vax"), -c(period, period_label))
+
+unvax_df <- combined %>%
+  filter(group == "Unvaccinated") %>%
+  rename_with(~ paste0(., "_unvax"), -c(period, period_label))
+
+df_diff <- inner_join(vax_df, unvax_df, by = c("period", "period_label"))
+
+df_diff <- df_diff %>%
+  mutate(
+    logHR_diff = logHR_vax - logHR_unvax,
+    se_diff = sqrt(SE_vax^2 + SE_unvax^2),
+    ci_low = logHR_diff - 1.96 * se_diff,
+    ci_high = logHR_diff + 1.96 * se_diff
+  )
+
+ggplot(df_diff, aes(x = period_label, y = logHR_diff)) +
+  geom_point(color = "blue", size = 3) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2, color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Difference in log(Hazard Ratio) (Vaccinated - Unvaccinated)",
+    x = "Exposure Period",
+    y = "Difference in log(Hazard Ratio)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
