@@ -36,7 +36,11 @@ ozp_prescriptions <- ozp %>%
   left_join(
     ozp_drugs_catalog %>% transmute(detail_id, drug_name, presc_id), by = c("detail_id", "drug_name")
   ) %>% 
-  transmute(client_id, presc_id, n_boxes, date)
+  transmute(client_id, presc_id, n_boxes, date)%>%
+  group_by(client_id) %>%
+  arrange(date) %>%
+  mutate(presc_order = row_number()) %>%
+  ungroup()
 
 
 ###### vaccination ######
@@ -85,7 +89,11 @@ cpzp_prescriptions <- cpzp %>%
   left_join(
     cpzp_drugs_catalog  %>% select(detail_id, detail_code, presc_id), by = c("detail_id", "detail_code")
   ) %>% 
-  transmute(client_id, presc_id, n_boxes, date, specialization)
+  transmute(client_id, presc_id, n_boxes, date, specialization) %>%
+  group_by(client_id) %>%
+  arrange(date) %>%
+  mutate(presc_order = row_number()) %>%
+  ungroup()
 
 ###### vaccination ######
 cpzp_vaccinations <- cpzp %>% 
