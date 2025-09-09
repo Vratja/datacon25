@@ -31,7 +31,7 @@ ozp_drugs_catalog <- ozp %>%
   ) %>% mutate(presc_id = 1:n())
 
 ozp_prescriptions <- ozp %>% 
-  filter(Typ_udalosti == "předpis") %>% 
+  filter(Typ_udalosti == "předpis", startsWith(ATC_skupina, "H02")) %>% 
   transmute(client_id = Id_pojistence, detail_id = Detail_udalosti, drug_name = Nazev, n_boxes = Pocet_baleni, date = as.Date(Datum_udalosti)) %>% 
   left_join(
     ozp_drugs_catalog %>% transmute(detail_id, drug_name, presc_id), by = c("detail_id", "drug_name")
@@ -83,7 +83,7 @@ cpzp_drugs_catalog <- cpzp %>%
   ) %>% mutate(presc_id = (1:n()) + 1000)
 
 cpzp_prescriptions <- cpzp %>% 
-  filter(Typ_udalosti == "předpis") %>% 
+  filter(Typ_udalosti == "předpis", startsWith(ATC_skupina, "H02")) %>% 
   transmute(client_id = Id_pojistence, detail_id = Detail_udalosti, detail_code = Kod_udalosti, n_boxes = Pocet_baleni, 
             date = as.Date(Datum_udalosti), specialization = Specializace) %>% 
   left_join(

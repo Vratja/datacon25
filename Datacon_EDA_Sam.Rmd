@@ -25,6 +25,11 @@ library(pheatmap)
 library(viridisLite)
 library(SCCS)
 library(broom)
+library(mgcv)
+library(gratia)
+library(survminer)
+library(survival)
+library(data.table)
 
 con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
 #dbDisconnect(con, shutdown = TRUE)
@@ -603,8 +608,8 @@ prescriptions_daily <- prescriptions <- dbGetQuery(
     JOIN cpzp_ins_start_end i ON c.client_id = i.client_id
     WHERE p.date IS NOT NULL
     AND i.ins_end_date = '9999-12-31' AND i.ins_start_date <= '2015-01-01'
-    AND p.date >= '2020-03-01' AND p.date <= '2023-01-01'
-    AND p.presc_order = 1
+    AND p.date >= '2020-03-01' AND p.date <= '2024-01-01'
+    -- AND p.presc_order = 1
 
   "
 ) %>%
@@ -651,7 +656,7 @@ prescriptions_counts <- prescriptions_daily %>%
   )
 
 incidence_prescriptions <- prescriptions_counts %>%
-  inner_join(incidence_daily, by = "date")
+  full_join(incidence_daily, by = "date")
 
 max_lag <- 365
 
@@ -1148,4 +1153,864 @@ ggplot(df_diff, aes(x = period_label, y = logHR_diff)) +
   ) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+#### First prescription weighted by population ####
+```{r}
+first_presc <- dbGetQuery(con,
+                          "
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.date ASC) AS first_presc_date,
+                            'CPZP' AS ins_company
+                          FROM
+                            cpzp_clients c
+                          LEFT JOIN cpzp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN cpzp_prescriptions p ON c.client_id = p.client_id AND p.presc_order = 1
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date = '9999-12-31'
+                            
+                          UNION
+                          
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.date ASC) AS first_presc_date,
+                            'OZP' AS ins_company
+                          FROM
+                            ozp_clients c
+                          LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN ozp_prescriptions p ON c.client_id = p.client_id AND p.presc_order = 1
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date IS NULL
+                          ") %>%
+  mutate(first_presc_yearmonth = floor_date(first_presc_date, unit = "month"),
+         sex = ifelse(sex == "Z", "F", sex),
+         vacc_status = ifelse(n_vacc > 0, "Vaccinated", "Non-vaccinated"),
+         age_2021 = 2021 - birthyear) %>%
+  mutate(age_class = case_when(
+    age_2021 >= 5 & age_2021 <= 11 ~ "5-11",
+    age_2021 >= 12 & age_2021 <= 15 ~ "12-15",
+    age_2021 >= 16 & age_2021 <= 29 ~ "16-29",
+    age_2021 >= 30 & age_2021 <= 34 ~ "30-34",
+    age_2021 >= 35 & age_2021 <= 39 ~ "35-39",
+    age_2021 >= 40 & age_2021 <= 44 ~ "40-44",
+    age_2021 >= 45 & age_2021 <= 49 ~ "45-49",
+    age_2021 >= 50 & age_2021 <= 54 ~ "50-54",
+    age_2021 >= 55 & age_2021 <= 59 ~ "55-59",
+    age_2021 >= 60 & age_2021 <= 64 ~ "60-64",
+    age_2021 >= 65 & age_2021 <= 69 ~ "65-69",
+    age_2021 >= 70 & age_2021 <= 79 ~ "70-79",
+    age_2021 >= 80 ~ "80+",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(age_class = factor(age_class,
+                            levels = c("5-11","12-15","16-29","30-34","35-39","40-44",
+                                       "45-49","50-54","55-59","60-64","65-69","70-79","80+"),
+                            ordered = TRUE))
+
+monthly_first_presc <- first_presc %>%
+  count(first_presc_yearmonth, name = "new_prescriptions") %>%
+  arrange(first_presc_yearmonth)
+
+monthly_first_presc <- monthly_first_presc %>%
+  mutate(
+    cum_new_presc = cumsum(new_prescriptions),  
+    total_population = nrow(first_presc),
+    at_risk_population = total_population - lag(cum_new_presc, default = 0),
+    rate = new_prescriptions / at_risk_population
+  )
+
+monthly_first_presc <- monthly_first_presc %>%
+  mutate(
+    period_group = case_when(
+      first_presc_yearmonth < as.Date("2020-01-01") ~ "Pre-COVID",
+      first_presc_yearmonth >= as.Date("2021-12-31") ~ "Post-COVID",
+      TRUE ~ "COVID-Shock"
+    )
+  )
+
+monthly_clean <- monthly_first_presc %>%
+  filter(first_presc_yearmonth >= as.Date("2018-01-01")) %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID"))
+
+t.test(rate ~ period_group, data = monthly_clean)
+
+ggplot(monthly_first_presc %>% filter(first_presc_yearmonth >= as.Date("2018-01-01")),
+       aes(x = first_presc_yearmonth, y = rate * 1000)) +
+  geom_line(color = "steelblue", size = 1) +
+  # Highlight COVID disruption window
+  annotate("rect",
+           xmin = as.Date("2020-01-01"), xmax = as.Date("2021-12-31"),
+           ymin = -Inf, ymax = Inf, alpha = 0.2, fill = "gray50") +
+  scale_y_continuous(name = "Prescriptions per 1,000 at-risk clients", limits = c(0, 5)) +
+  labs(
+    title = "First Prescription Rate Over Time (General Population)",
+    subtitle = "Gray area = COVID disruption window (excluded from t-test)",
+    x = "Year-Month",
+    caption = "Source: First prescription records"
+  ) +
+  theme_minimal()
+
+total_by_vacc <- first_presc %>%
+  count(vacc_status, name = "total_population")
+
+monthly_by_vacc <- first_presc %>%
+  count(vacc_status, first_presc_yearmonth, name = "new_prescriptions") %>%
+  arrange(vacc_status, first_presc_yearmonth) %>%
+  group_by(vacc_status) %>%
+  mutate(
+    cum_prescriptions = cumsum(new_prescriptions),
+    total_population = total_by_vacc$total_population[match(vacc_status, total_by_vacc$vacc_status)],
+    at_risk_population = total_population - lag(cum_prescriptions, default = 0),
+    rate = new_prescriptions / at_risk_population,
+    covid_period = ifelse(first_presc_yearmonth < as.Date("2020-01-01"), "Before COVID", "After COVID")
+  ) %>%
+  ungroup()
+
+monthly_by_vacc <- monthly_by_vacc %>%
+  mutate(
+    period_group = case_when(
+      first_presc_yearmonth < as.Date("2020-01-01") ~ "Pre-COVID",
+      first_presc_yearmonth >= as.Date("2021-12-31") ~ "Post-COVID",
+      TRUE ~ "COVID-Shock"
+    )
+  )
+
+monthly_by_vacc_clean <- monthly_by_vacc %>%
+  filter(first_presc_yearmonth >= as.Date("2018-01-01")) %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID"))
+
+monthly_by_vacc_clean %>%
+  group_by(vacc_status) %>%
+  summarise(
+    p_value = t.test(rate ~ period_group)$p.value,
+    mean_before = mean(rate[period_group == "Pre-COVID"]),
+    mean_after = mean(rate[period_group == "Post-COVID"])
+  )
+
+ggplot(monthly_by_vacc %>% filter(first_presc_yearmonth >= as.Date("2018-01-01")),
+       aes(x = first_presc_yearmonth, y = rate * 1000, color = vacc_status)) +
+  geom_line(size = 1) +
+  annotate("rect",
+           xmin = as.Date("2020-01-01"), xmax = as.Date("2021-12-31"),
+           ymin = -Inf, ymax = Inf, alpha = 0.2, fill = "gray50") +
+  scale_y_continuous(name = "Prescriptions per 1,000 at-risk clients", limits = c(0, 7)) +
+  labs(
+    title = "First Prescription Rate Over Time by Vaccination Status",
+    subtitle = "Gray area = COVID disruption window (excluded from t-tests)",
+    x = "Year-Month",
+    color = "Vaccination Status"
+  ) +
+  theme_minimal()
+
+# Total population per age group
+total_by_age <- first_presc %>%
+  count(age_class, name = "total_population")
+
+# Monthly new prescriptions by age group
+monthly_by_age <- first_presc %>%
+  count(age_class, first_presc_yearmonth, name = "new_prescriptions") %>%
+  arrange(age_class, first_presc_yearmonth) %>%
+  group_by(age_class) %>%
+  mutate(
+    cum_prescriptions = cumsum(new_prescriptions),
+    total_population = total_by_age$total_population[match(age_class, total_by_age$age_class)],
+    at_risk_population = total_population - lag(cum_prescriptions, default = 0),
+    rate = new_prescriptions / at_risk_population
+  ) %>%
+  ungroup()
+
+monthly_by_age <- monthly_by_age %>%
+  mutate(
+    period_group = case_when(
+      first_presc_yearmonth < as.Date("2020-01-01") ~ "Pre-COVID",
+      first_presc_yearmonth >= as.Date("2021-12-31") ~ "Post-COVID",
+      TRUE ~ "COVID-Shock"
+    )
+  )
+
+monthly_by_age_clean <- monthly_by_age %>%
+  filter(first_presc_yearmonth >= as.Date("2018-01-01")) %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID"))
+
+monthly_by_age_clean %>%
+  group_by(age_class) %>%
+  summarise(
+    p_value = t.test(rate ~ period_group)$p.value,
+    mean_before = mean(rate[period_group == "Pre-COVID"], na.rm = TRUE),
+    mean_after = mean(rate[period_group == "Post-COVID"], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(monthly_by_age %>% filter(first_presc_yearmonth >= as.Date("2018-01-01")),
+       aes(x = first_presc_yearmonth, y = rate * 1000)) +
+  geom_line(size = 1, color = "#2c3e50") +
+  annotate("rect",
+           xmin = as.Date("2020-01-01"), xmax = as.Date("2021-12-31"),
+           ymin = -Inf, ymax = Inf, alpha = 0.2, fill = "gray50") +
+  facet_wrap(~ age_class, scales = "free_y") +
+  scale_y_continuous(name = "Prescriptions per 1,000 at-risk clients", limits = c(0, 10)) +
+  labs(
+    title = "First Prescription Rate Over Time by Age Group",
+    subtitle = "Gray area = COVID disruption window (excluded from t-tests)",
+    x = "Year-Month"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+#### First prescription rates over age x vax ####
+```{r}
+monthly_by_age_vacc <- first_presc %>%
+  count(age_class, vacc_status, first_presc_yearmonth, name = "new_prescriptions") %>%
+  arrange(age_class, vacc_status, first_presc_yearmonth) %>%
+  group_by(age_class, vacc_status) %>%
+  mutate(
+    cum_prescriptions = cumsum(new_prescriptions),
+    total_population = total_by_age$total_population[match(age_class, total_by_age$age_class)],
+    at_risk_population = total_population - lag(cum_prescriptions, default = 0),
+    rate = new_prescriptions / at_risk_population
+  ) %>%
+  ungroup() %>%
+  mutate(
+    period_group = case_when(
+      first_presc_yearmonth < as.Date("2020-01-01") ~ "Pre-COVID",
+      first_presc_yearmonth >= as.Date("2021-12-31") ~ "Post-COVID",
+      TRUE ~ "COVID-Shock"
+    ),
+    rate_per_1k = rate * 1000
+  ) %>%
+  filter(first_presc_yearmonth >= as.Date("2018-01-01"))
+
+level_shift_results <- monthly_by_age_vacc %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID")) %>%
+  filter(age_class %in% c("5-11", "12-15", "16-29", "30-34", "35-39")) %>%
+  group_by(age_class, vacc_status) %>%
+  summarise(
+    p_value = t.test(rate ~ period_group)$p.value,
+    mean_pre = mean(rate[period_group == "Pre-COVID"], na.rm = TRUE),
+    mean_post = mean(rate[period_group == "Post-COVID"], na.rm = TRUE),
+    diff = mean_post - mean_pre,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_sig = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01 ~ "**",
+      p_value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    ),
+    mean_pre_per_1k = mean_pre * 1000,
+    mean_post_per_1k = mean_post * 1000,
+    diff_per_1k = diff * 1000
+  )
+
+ggplot(level_shift_results, aes(x = age_class, y = diff_per_1k, fill = vacc_status)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  geom_text(aes(label = p_sig), vjust = -0.5, position = position_dodge(0.8)) +
+  labs(
+    title = "Level Shift in First Prescription Rate (Post-COVID vs Pre-COVID)",
+    subtitle = "Rate difference per 1,000 at-risk people (excluding COVID shock period)",
+    x = "Age Group", y = "Rate Difference (per 1,000)",
+    fill = "Vaccination Status"
+  ) +
+  theme_minimal()
+```
+
+```{r, fig.height=12, fig.width=8}
+ggplot(
+  monthly_by_age_vacc %>% 
+    filter(age_class %in% c("5-11", "12-15", "16-29", "30-34", "35-39")),
+  aes(x = first_presc_yearmonth, y = rate_per_1k, color = vacc_status)
+) +
+  geom_line(size = 1) +
+  annotate("rect",
+           xmin = as.Date("2020-01-01"), xmax = as.Date("2021-12-31"),
+           ymin = -Inf, ymax = Inf, alpha = 0.2, fill = "gray50") +
+  scale_y_continuous(name = "Prescriptions per 1,000 at-risk clients") +
+  labs(
+    title = "First Prescription Rate Over Time by Age Group and Vaccination Status",
+    subtitle = "Gray area = COVID disruption window (excluded from mean comparisons)",
+    x = "Year-Month",
+    color = "Vaccination Status"
+  ) +
+  facet_wrap(~ age_class, ncol = 1, scales = "free_y") +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+#### DiD test ####
+
+```{r}
+monthly_rates <- monthly_by_age_vacc %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID")) %>%
+  filter(age_class == "16-29") %>%
+  mutate(
+    vaccinated = if_else(vacc_status == "Vaccinated", 1, 0),
+    post_covid = if_else(first_presc_yearmonth >= as.Date("2022-01-01"), 1, 0),
+    interaction = vaccinated * post_covid
+  )
+
+did_model <- lm(rate_per_1k ~ vaccinated * post_covid, data = monthly_rates)
+summary(did_model)
+```
+
+#### Ratio change instead of absolute change ####
+```{r}
+ratio_change_results <- monthly_by_age_vacc %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID")) %>%
+  filter(age_class %in% c("5-11", "12-15", "16-29", "30-34", "35-39")) %>%
+  mutate(log_rate = log(rate)) %>%
+  group_by(age_class, vacc_status) %>%
+  summarise(
+    p_value = t.test(log_rate ~ period_group)$p.value,
+    mean_pre = mean(rate[period_group == "Pre-COVID"], na.rm = TRUE),
+    mean_post = mean(rate[period_group == "Post-COVID"], na.rm = TRUE),
+    rate_ratio = mean_post / mean_pre,
+    log_ratio = log(rate_ratio),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_sig = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01 ~ "**",
+      p_value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    ),
+    rate_ratio_label = sprintf("%.2fx", rate_ratio)
+  )
+
+ggplot(ratio_change_results, aes(x = age_class, y = rate_ratio, fill = vacc_status)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  geom_text(aes(label = p_sig), vjust = -0.5, position = position_dodge(0.8), size = 4) +
+  geom_text(aes(label = rate_ratio_label), vjust = 1.5, position = position_dodge(0.8), 
+            color = "white", size = 3.5) +
+  geom_text(aes(label = sprintf("log=%.3f", log_ratio)), 
+            vjust = 2.8, position = position_dodge(0.8), 
+            size = 3, color = "gray30") +
+  labs(
+    title = "Relative Change in First Prescription Rate (Post-COVID vs Pre-COVID)",
+    subtitle = "Bar height = Rate ratio | Labels show significance and log(ratio)",
+    x = "Age Group", y = "Rate Ratio (Post / Pre)",
+    fill = "Vaccination Status"
+  ) +
+  theme_minimal()
+
+did_model_rate <- lm(log(rate_per_1k) ~ vaccinated * post_covid, data = monthly_rates)
+exp(coef(did_model_rate)["vaccinated:post_covid"])
+summary(did_model_rate)
+```
+
+#### Multi-Presc rate ####
+```{r}
+multi_presc <- dbGetQuery(con,
+                          "
+                          SELECT
+                          p.client_id,
+                          p.date,
+                          CAST(d.strength AS DOUBLE) * d.Prednison_equiv AS Prednison_equiv,
+                          d.ATC_group
+                          FROM
+                          ozp_prescriptions p
+                          LEFT JOIN ozp_drugs_catalog d ON p.presc_id = d.presc_id
+                          INNER JOIN ozp_ins_start_end i ON p.client_id = i.client_id
+                                                         AND i.ins_start_date < '2015-01-01'
+                                                         AND i.ins_end_date IS NULL
+                          WHERE d.Prednison_equiv IS NOT NULL
+                          
+                          UNION
+                          
+                          SELECT
+                          p.client_id,
+                          p.date,
+                          CAST(d.force AS DOUBLE) * d.Prednison_equiv AS Prednison_equiv,
+                          d.ATC_group
+                          FROM
+                          cpzp_prescriptions p
+                          LEFT JOIN cpzp_drugs_catalog d ON p.presc_id = d.presc_id
+                          INNER JOIN cpzp_ins_start_end i ON p.client_id = i.client_id
+                                                         AND i.ins_start_date < '2015-01-01'
+                                                         AND i.ins_end_date = '9999-12-31'
+                          WHERE d.Prednison_equiv IS NOT NULL
+                          ")%>%
+  mutate(month = floor_date(date, unit = "month"))
+
+monthly_prescriptions <- multi_presc %>%
+  group_by(month) %>%
+  summarise(prescription_count = n(), .groups = "drop")
+
+ggplot(monthly_prescriptions, aes(x = month, y = prescription_count)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(color = "steelblue") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred", size = 1) +
+  labs(title = "Number of Prescriptions Over Time (with Trend Line)",
+       x = "Month",
+       y = "Number of Prescriptions") +
+  theme_minimal()
+
+daily_presc <- multi_presc %>%
+  group_by(client_id, date) %>%
+  summarise(prescriptions = n(), .groups = "drop")
+
+daily_presc <- daily_presc %>%
+  mutate(month = floor_date(date, "month"))
+
+avg_presc_per_client_day <- daily_presc %>%
+  group_by(month) %>%
+  summarise(
+    avg_prescriptions = mean(prescriptions),
+    .groups = "drop"
+  )
+
+ggplot(avg_presc_per_client_day, aes(x = month, y = avg_prescriptions)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(color = "steelblue") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred", size = 1) +
+  labs(
+    title = "Average Prescriptions per Client per Day Over Time",
+    x = "Month",
+    y = "Avg. Prescriptions per Client per Day"
+  ) +
+  theme_minimal()
+
+avg_dose_over_time <- multi_presc %>%
+  group_by(month) %>%
+  summarise(avg_dose = mean(Prednison_equiv, na.rm = TRUE),
+            .groups = "drop")
+
+ggplot(avg_dose_over_time, aes(x = month, y = avg_dose)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(color = "steelblue") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred", size = 1) +
+  labs(
+    title = "Average Prednison Equivalent Dose Over Time",
+    x = "Month",
+    y = "Average Dose (Prednison equivalent)"
+  ) +
+  theme_minimal()
+
+
+multi_presc <- multi_presc %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(client_id, date)
+
+
+washout_end <- as.Date("2016-12-31")
+
+
+clients_before_washout <- multi_presc %>%
+  filter(date <= washout_end) %>%
+  pull(client_id) %>%
+  unique()
+
+
+multi_presc_clean <- multi_presc %>%
+  filter(!client_id %in% clients_before_washout)
+
+
+multi_presc_clean <- multi_presc_clean %>%
+  group_by(client_id) %>%
+  mutate(next_date = lead(date),
+         time_to_next = as.numeric(next_date - date),
+         event = ifelse(!is.na(next_date), 1, 0)) %>%
+  ungroup()
+
+
+first_presc <- multi_presc_clean %>%
+  group_by(client_id) %>%
+  summarise(first_date = min(date), .groups = "drop") %>%
+  mutate(cohort_year = lubridate::year(first_date))
+
+multi_presc_clean <- multi_presc_clean %>%
+  left_join(first_presc, by = "client_id")
+
+multi_presc_clean <- multi_presc_clean %>%
+  filter(time_to_next <= 180 | is.na(time_to_next)) %>%
+  mutate(event = ifelse(time_to_next <= 180, 1, 0),
+         time_to_next = pmin(time_to_next, 180))
+
+
+cox_model <- coxph(Surv(time_to_next, event) ~ factor(cohort_year), data = multi_presc_clean)
+summary(cox_model)
+
+
+fit <- survfit(Surv(time_to_next, event) ~ factor(cohort_year), data = multi_presc_clean)
+```
+
+#### Cox proportional hazard multi-presc
+```{r, fig.height=12, fig.width=10}
+ggsurvplot(fit, 
+           data = multi_presc_clean,
+           risk.table = TRUE,
+           title = "Time to Next Prescription by Cohort Year",
+           xlab = "Days since last prescription",
+           ylab = "Probability of no next prescription")
+```
+
+#### first presc vs multi presc ####
+```{r}
+multi_presc <- multi_presc %>%
+  mutate(date = as.Date(date),
+         year_month = floor_date(date, "month"))
+
+# 1. Create a clean table with first prescription per client
+first_presc <- multi_presc %>%
+  group_by(client_id) %>%
+  summarise(first_presc_date = min(date), .groups = "drop")
+
+# 2. Join and create indicator for first prescription
+multi_presc <- multi_presc %>%
+  left_join(first_presc, by = "client_id") %>%
+  mutate(is_first_presc = (date == first_presc_date))
+
+summary_by_month <- multi_presc %>%
+  group_by(year_month) %>%
+  summarise(
+    n_total_prescriptions = n(),
+    n_first_prescriptions = sum(is_first_presc),
+    n_clients_prescribed = n_distinct(client_id),
+    avg_prescriptions_per_client = n_total_prescriptions / n_clients_prescribed,
+    share_first_prescriptions = n_first_prescriptions / n_total_prescriptions,
+    .groups = "drop"
+  ) %>%
+  filter(year_month >= '2018-01-01')
+
+ggplot(summary_by_month, aes(x = year_month)) +
+  geom_line(aes(y = n_total_prescriptions, color = "Total")) +
+  geom_line(aes(y = n_first_prescriptions, color = "First")) +
+  labs(
+    title = "Total vs First Prescriptions Over Time",
+    x = "Month", y = "Count",
+    color = "Type"
+  ) +
+  theme_minimal()
+
+ggplot(summary_by_month, aes(x = year_month, y = share_first_prescriptions)) +
+  geom_line(color = "darkgreen") +
+  geom_smooth(method = "loess", se = FALSE, color = "black") +
+  labs(
+    title = "Share of First Prescriptions Over Time",
+    y = "Share of Total Prescriptions",
+    x = "Month"
+  ) +
+  theme_minimal()
+
+ggplot(summary_by_month, aes(x = year_month, y = avg_prescriptions_per_client)) +
+  geom_line(color = "steelblue") +
+  geom_smooth(method = "loess", se = FALSE, color = "black") +
+  labs(
+    title = "Average Prescriptions per Client",
+    x = "Month", y = "Prescriptions per Client"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+first_presc_dynamic_age <- dbGetQuery(con,
+                          "
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.date ASC) AS first_presc_date,
+                            'CPZP' AS ins_company
+                          FROM
+                            cpzp_clients c
+                          LEFT JOIN cpzp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN cpzp_prescriptions p ON c.client_id = p.client_id AND p.presc_order = 1
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date = '9999-12-31'
+                            
+                          UNION
+                          
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.date ASC) AS first_presc_date,
+                            'OZP' AS ins_company
+                          FROM
+                            ozp_clients c
+                          LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN ozp_prescriptions p ON c.client_id = p.client_id AND p.presc_order = 1
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date IS NULL
+                          ") %>%
+  mutate(first_presc_yearmonth = floor_date(first_presc_date, unit = "month"),
+         sex = ifelse(sex == "Z", "F", sex),
+         vacc_status = ifelse(n_vacc > 0, "Vaccinated", "Non-vaccinated"),
+         age_at_presc = year(first_presc_date) - birthyear)
+
+obs_start <- 2017
+obs_end <- 2023
+max_age <- 80
+
+
+filtered_data <- first_presc_dynamic_age %>%
+  mutate(
+    year_of_presc = year(first_presc_date),
+    age_of_presc = year_of_presc - birthyear,
+    age_at_start = obs_start - birthyear,
+    age_at_end = obs_end - birthyear
+  ) %>%
+  filter(age_at_end >= 0) %>%   
+  filter(age_at_start <= max_age)
+
+age_seq <- 0:max_age
+
+at_risk_by_age <- lapply(age_seq, function(a) {
+  n <- filtered_data %>%
+    filter(is.na(age_of_presc) | age_of_presc > a) %>%
+    n_distinct(.$client_id)
+  data.frame(age = a, n_at_risk = n)
+}) %>%
+  bind_rows()
+
+first_presc_by_age <- filtered_data %>%
+  filter(!is.na(age_of_presc)) %>%
+  count(age = age_of_presc, name = "n_first_presc") %>%
+  filter(age <= max_age)
+
+age_analysis <- left_join(at_risk_by_age, first_presc_by_age, by = "age") %>%
+  mutate(
+    n_first_presc = replace_na(n_first_presc, 0),
+    prop_first_presc = n_first_presc / n_at_risk
+  )
+
+ggplot(age_analysis, aes(x = age, y = prop_first_presc)) +
+  geom_line(color = "blue") +
+  geom_point(aes(color = n_first_presc)) +
+  labs(
+    title = "First Prescription Probability by Age (2017–2023)",
+    x = "Age",
+    y = "Proportion First Prescribed"
+  ) +
+  theme_minimal()
+
+at_risk_by_age_sex <- lapply(age_seq, function(a) {
+  filtered_data %>%
+    filter(is.na(age_of_presc) | age_of_presc > a) %>%
+    group_by(sex) %>%
+    summarise(n_at_risk = n_distinct(client_id), .groups = "drop") %>%
+    mutate(age = a)
+}) %>%
+  bind_rows()
+
+first_presc_by_age_sex <- filtered_data %>%
+  filter(!is.na(age_of_presc)) %>%
+  group_by(sex, age = age_of_presc) %>%
+  summarise(n_first_presc = n_distinct(client_id), .groups = "drop") %>%
+  filter(age <= max_age)
+
+age_sex_analysis <- left_join(at_risk_by_age_sex, first_presc_by_age_sex, by = c("age", "sex")) %>%
+  mutate(
+    n_first_presc = replace_na(n_first_presc, 0),
+    prop_first_presc = n_first_presc / n_at_risk
+  )
+
+ggplot(age_sex_analysis, aes(x = age, y = prop_first_presc, color = sex)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1) +
+  labs(
+    title = "First Prescription Probability by Age and Sex (2017–2023)",
+    x = "Age",
+    y = "Proportion First Prescribed",
+    color = "Sex"
+  ) +
+  theme_minimal()
+
+# Calculate people at risk by age and vacc_status
+at_risk_by_age_vacc <- lapply(age_seq, function(a) {
+  filtered_data %>%
+    filter(is.na(age_of_presc) | age_of_presc > a) %>%
+    group_by(vacc_status) %>%
+    summarise(n_at_risk = n_distinct(client_id), .groups = "drop") %>%
+    mutate(age = a)
+}) %>%
+  bind_rows()
+
+first_presc_by_age_vacc <- filtered_data %>%
+  filter(!is.na(age_of_presc)) %>%
+  group_by(vacc_status, age = age_of_presc) %>%
+  summarise(n_first_presc = n_distinct(client_id), .groups = "drop") %>%
+  filter(age <= max_age)
+
+# Join and compute proportion
+age_vacc_analysis <- left_join(at_risk_by_age_vacc, first_presc_by_age_vacc, by = c("age", "vacc_status")) %>%
+  mutate(
+    n_first_presc = replace_na(n_first_presc, 0),
+    prop_first_presc = n_first_presc / n_at_risk
+  )
+
+ggplot(age_vacc_analysis, aes(x = age, y = prop_first_presc, color = vacc_status)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1) +
+  labs(
+    title = "First Prescription Probability by Age and Vaccination Status (2017–2023)",
+    x = "Age",
+    y = "Proportion First Prescribed",
+    color = "Vaccination Status"
+  ) +
+  theme_minimal()
+
+
+filtered_data <- filtered_data %>%
+  mutate(vaccsex = paste(vacc_status, "_", sex, sep = ""))
+
+at_risk_by_age_sex_vacc <- lapply(age_seq, function(a) {
+  filtered_data %>%
+    filter((is.na(age_of_presc) | age_of_presc > a) & a >= 2015 - birthyear & a <= 2023 - birthyear) %>%
+    group_by(vaccsex) %>%
+    summarise(n_at_risk = n_distinct(client_id), .groups = "drop") %>%
+    mutate(age = a)
+}) %>%
+  bind_rows()
+
+first_presc_by_age_vacc <- filtered_data %>%
+  filter(!is.na(age_of_presc)) %>%
+  group_by(vaccsex, age = age_of_presc) %>%
+  summarise(n_first_presc = n_distinct(client_id), .groups = "drop") %>%
+  filter(age <= max_age)
+
+# Join and compute proportion
+age_vacc_analysis <- left_join(at_risk_by_age_sex_vacc, first_presc_by_age_vacc, by = c("age", "vaccsex")) %>%
+  mutate(
+    n_first_presc = replace_na(n_first_presc, 0),
+    prop_first_presc = n_first_presc / n_at_risk
+  )
+
+ggplot(age_vacc_analysis, aes(x = age, y = prop_first_presc, color = vaccsex)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1) +
+  labs(
+    title = "First Prescription Probability by Age and Vaccination Status (2017–2023)",
+    x = "Age",
+    y = "Proportion First Prescribed",
+    color = "Vaccination:Sex Status"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+presc_id_counts <- dbGetQuery(con,
+                          "
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            2021 - c.birthyear AS age_2021,
+                            p.date as presc_date,
+                            p.presc_order,
+                            'CPZP' AS ins_company,
+                            YEAR(FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.presc_order ASC)) AS first_presc_year
+                          FROM
+                            cpzp_clients c
+                          LEFT JOIN cpzp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN cpzp_prescriptions p ON c.client_id = p.client_id
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date = '9999-12-31'
+                            
+                          UNION
+                          
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            2021 - c.birthyear AS age_2021,
+                            p.date as presc_date,
+                            p.presc_order,
+                            'OZP' AS ins_company,
+                            YEAR(FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.presc_order ASC)) AS first_presc_year
+                          FROM
+                            ozp_clients c
+                          LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN ozp_prescriptions p ON c.client_id = p.client_id
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date IS NULL
+                          ")
+
+monthly_unique_clients <- presc_id_counts %>%
+  filter(age_2021 >= 16 & age_2021 <= 29) %>%
+  mutate(yearmonth = floor_date(presc_date, unit = "month")) %>%
+  distinct(client_id, yearmonth) %>%
+  count(yearmonth, name = "n_unique_clients")
+
+ggplot(monthly_unique_clients %>% filter(yearmonth > '2016-01-01'), aes(x = yearmonth, y = n_unique_clients)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(size = 1.5) +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred", linewidth = 1) +
+  labs(
+    title = "Unique Clients by Year-Month with Smoothed Trend",
+    x = "Year-Month",
+    y = "Number of Unique Clients"
+  ) +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "3 months", expand = c(0, 0)) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Step 1: Extract year from prescription date
+presc_years <- presc_id_counts %>%
+  mutate(
+    presc_year = year(presc_date)
+  ) %>%
+  distinct(client_id, first_presc_year, presc_year) %>%
+  filter(first_presc_year >= 2017, first_presc_year <= 2023)
+
+# Step 2: Calculate offset (years since first_presc_year)
+retention_data <- presc_years %>%
+  mutate(year_offset = presc_year - first_presc_year) %>%
+  filter(year_offset >= 0)  # Only after or during start year
+
+# Step 3: Count how many clients were active in each offset year per cohort
+retention_summary <- retention_data %>%
+  group_by(first_presc_year, year_offset) %>%
+  summarise(n_clients = n_distinct(client_id), .groups = "drop")
+
+# Step 4: Get cohort sizes
+cohort_sizes <- retention_data %>%
+  filter(year_offset == 0) %>%
+  group_by(first_presc_year) %>%
+  summarise(cohort_size = n_distinct(client_id), .groups = "drop")
+
+# Step 5: Calculate retention rate
+retention_summary <- retention_summary %>%
+  left_join(cohort_sizes, by = "first_presc_year") %>%
+  mutate(retention_rate = n_clients / cohort_size)
+
+retention_summary_filtered <- retention_summary %>%
+  filter(year_offset > 0)
+
+# Step 6: Plot
+ggplot(retention_summary_filtered, aes(x = year_offset, y = retention_rate, color = as.factor(first_presc_year))) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_color_viridis_d(name = "First Prescription Year") +
+  labs(
+    title = "Client Retention by First Prescription Year (Excluding Year 0)",
+    x = "Years Since First Prescription",
+    y = "Retention Rate"
+  ) +
+  theme_minimal(base_size = 13)
 ```
