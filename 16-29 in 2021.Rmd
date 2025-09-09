@@ -1,0 +1,1818 @@
+---
+title: "16-29 2021"
+author: "Sam"
+date: "2025-07-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+rm(list=ls(all=TRUE))
+gc()
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(data.table)
+library(survminer)
+library(survival)
+library(duckdb)
+library(tidyr)
+library(SCCS)
+library(stringr)
+library(scales)
+library(forecast)
+library(changepoint)
+library(purrr)
+
+con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
+#dbDisconnect(con, shutdown = TRUE)
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+prescriptions <- dbGetQuery(con,
+                          "
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            2021 - c.birthyear AS age_2021,
+                            FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.presc_order ASC) AS first_presc_date,
+                            p.date AS presc_date,
+                            v.date AS vacc_date,
+                            d.drug_form,
+                            d.ATC_group,
+                            d.Prednison_equiv AS prednison_equiv,
+                            d.force AS strength,
+                            'CPZP' AS ins_company
+                          FROM
+                            cpzp_clients c
+                          LEFT JOIN cpzp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN cpzp_prescriptions p ON c.client_id = p.client_id
+                          LEFT JOIN cpzp_vaccinations v ON c.client_id = v.client_id AND event_order = 1
+                          LEFT JOIN cpzp_drugs_catalog d ON p.presc_id  = d.presc_id 
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date = '9999-12-31'
+                            AND 2021 - c.birthyear BETWEEN 12 AND 15
+                            
+                          UNION
+                          
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            2021 - c.birthyear AS age_2021,
+                            FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.date ASC) AS first_presc_date,
+                            p.date AS presc_date,
+                            v.date AS vacc_date,
+                            d.drug_form,
+                            d.ATC_group,
+                            d.Prednison_equiv AS prednison_equiv,
+                            d.strength,
+                            'OZP' AS ins_company
+                          FROM
+                            ozp_clients c
+                          LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN ozp_prescriptions p ON c.client_id = p.client_id
+                          LEFT JOIN ozp_vaccinations v ON c.client_id = v.client_id AND event_order = 1
+                          LEFT JOIN ozp_drugs_catalog d ON p.presc_id = d.presc_id 
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date IS NULL
+                            AND 2021 - c.birthyear BETWEEN 12 AND 15
+                          ") %>%
+  mutate(client_id = as.numeric(factor(client_id)),
+         vacc_yearmonth = floor_date(vacc_date, unit = "month"),
+         presc_yearmonth = floor_date(presc_date, unit = "month"),
+         vaccinated = ifelse(n_vacc > 0, "Vaccinated", "Not Vaccinated"),
+         sex = ifelse(sex == "Z", "F", sex),
+         first_presc_flag = ifelse(!is.na(presc_date) & first_presc_date == presc_date,1,0))
+
+```
+
+# Test vekoveho rozlozeni skupin
+```{r}
+unique_clients <- prescriptions %>%
+  filter(!is.na(age_2021), !is.na(sex), !is.na(vaccinated)) %>%
+  distinct(client_id, .keep_all = TRUE)  
+
+age_data <- unique_clients %>%
+  group_by(vaccinated, age_2021) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(vaccinated) %>%
+  mutate(prop = count / sum(count),
+         variable = "Age",
+         value = as.character(age_2021)) %>%
+  ungroup()
+
+sex_data <- unique_clients %>%
+  group_by(vaccinated, sex) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(vaccinated) %>%
+  mutate(prop = count / sum(count),
+         variable = "Sex",
+         value = sex) %>%
+  ungroup()
+
+ggplot(unique_clients, aes(x = age_2021, fill = factor(vaccinated))) +
+  geom_histogram(aes(y = after_stat(density)), position = "identity", alpha = 0.4, binwidth = 1) +
+  scale_fill_brewer(palette = "Set1", name = "Vaccinated") +
+  scale_x_continuous(breaks = seq(floor(min(unique_clients$age)), ceiling(max(unique_clients$age)), by = 1)) +
+  labs(
+    title = "Age Distribution by Vaccination Group (Normalized Histogram)",
+    x = "Age", y = "Density",
+    fill = "Vaccinated"
+  ) +
+  theme_minimal()
+
+ggplot(sex_data, aes(x = sex, y = prop, color = vaccinated, group = vaccinated)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Sex Distribution by Vaccination Group",
+    x = "Sex",
+    y = "Proportion",
+    color = "Vaccinated"
+  ) +
+  theme_minimal()
+```
+
+## Předpisy celkem
+Existuje viditelný nárust celkového úhnru předpisů v čase se zvýšenou mírou nárustu po a během COVIDu.
+```{r, echo=FALSE}
+total_presc_by_month <- prescriptions %>%
+  filter(!is.na(presc_yearmonth)) %>%
+  group_by(presc_yearmonth) %>%
+  summarise(total_prescriptions = n()) %>%
+  ungroup()
+
+ggplot(total_presc_by_month, aes(x = presc_yearmonth, y = total_prescriptions)) +
+  geom_vline(xintercept = as.numeric(as.Date("2020-12-01")), linetype = "dotted", color = "gray70", linewidth = 0.4) +
+  geom_line(color = "steelblue", linewidth = 1, alpha = 0.6) +
+  stat_smooth(method = "loess", span = 0.3, se = TRUE, linewidth = 1.5, color = "darkorange") +
+  scale_x_date(
+    date_labels = "%Y",
+    date_breaks = "1 year",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  labs(
+    title = "Total Prescriptions Over Time",
+    x = "Year",
+    y = "Number of Prescriptions"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(color = "black", size = 12, face = "bold"),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5)
+  )
+
+
+grouped_presc <- prescriptions %>%
+  filter(!is.na(presc_yearmonth)) %>%
+  group_by(presc_yearmonth, sex, vaccinated) %>%
+  summarise(total_prescriptions = n()) %>%
+  ungroup()
+
+ggplot(grouped_presc, aes(x = presc_yearmonth, y = total_prescriptions,
+                         color = vaccinated, linetype = sex)) +
+  geom_vline(xintercept = as.numeric(as.Date("2020-12-01")), linetype = "dotted", color = "gray70", linewidth = 0.4) +
+  geom_line(linewidth = 1, alpha = 0.8) +
+  stat_smooth(method = "loess", span = 0.3, se = TRUE, linewidth = 1.5, aes(color = vaccinated), linetype = "solid") +
+  scale_x_date(
+    date_labels = "%Y",
+    date_breaks = "1 year",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_color_manual(values = c("Vaccinated" = "darkgreen", "Not Vaccinated" = "firebrick")) +
+  labs(
+    title = "Prescriptions by Sex and Vaccination Status Over Time",
+    x = "Year",
+    y = "Number of Prescriptions",
+    color = "Vaccination Status",
+    linetype = "Sex"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(color = "black", size = 12, face = "bold"),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5)
+  )
+
+```
+
+# Residualy celkoveho uhnru predpisu podle modelu do r 2020
+```{r}
+prescriptions_clean <- prescriptions %>%
+  filter(!is.na(presc_date)) %>%
+  mutate(presc_date = as.Date(presc_date)) %>%
+  arrange(presc_date) %>%
+  filter(presc_date >= as.Date("2015-01-01") & presc_date <= as.Date("2023-12-31")) %>%
+  mutate(count = 1)  
+
+monthly_data <- prescriptions_clean %>%
+  mutate(month = floor_date(presc_date, "month")) %>%
+  group_by(month) %>%
+  summarise(prescriptions = sum(count), .groups = 'drop')
+
+train_data <- monthly_data %>% filter(month < as.Date("2020-01-01"))
+test_data  <- monthly_data %>% filter(month >= as.Date("2020-01-01"))
+
+ts_train <- ts(train_data$prescriptions, start = c(2015, 1), frequency = 12)
+
+fit <- ets(ts_train)
+
+n_ahead <- nrow(test_data)
+forecast_result <- forecast(fit, h = n_ahead)
+
+comparison <- test_data %>%
+  mutate(
+    predicted = as.numeric(forecast_result$mean),
+    residual = prescriptions - predicted
+  )
+
+rmse <- sqrt(mean(comparison$residual^2))
+print(paste("RMSE (2020 onwards):", round(rmse, 2)))
+
+ggplot() +
+  geom_line(data = monthly_data, aes(x = month, y = prescriptions), color = "blue", size = 1, alpha = 0.6) +
+  geom_line(data = comparison, aes(x = month, y = predicted), color = "red", size = 1, linetype = "dashed") +
+  geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dotted") +
+  labs(title = "Actual vs Forecasted Prescriptions",
+       subtitle = "Red = Forecasted, Blue = Actual",
+       x = "Date", y = "Prescriptions")
+
+ggplot(comparison, aes(x = month, y = residual)) +
+  geom_line(color = "darkgreen", size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals (Actual - Forecast)", x = "Date", y = "Residual")
+```
+# ?
+```{r}
+monthly_data <- monthly_data %>%
+  arrange(month) %>%
+  mutate(time_index = row_number())
+
+train_data <- monthly_data %>% filter(month < as.Date("2020-01-01"))
+test_data  <- monthly_data %>% filter(month >= as.Date("2020-01-01"))
+
+
+ts_train <- ts(train_data$prescriptions, frequency = 12, start = c(2015, 1))
+ets_model <- ets(ts_train)
+
+forecast_result <- forecast(ets_model, h = nrow(test_data))
+
+test_data$predicted <- as.numeric(forecast_result$mean)
+train_data$predicted <- as.numeric(fitted(ets_model))
+
+# Combine for plotting
+plot_data_lm <- bind_rows(train_data, test_data)
+
+# Plot
+ggplot(plot_data_lm, aes(x = month)) +
+  geom_line(aes(y = prescriptions), color = "blue") +
+  geom_line(aes(y = predicted), color = "red", linetype = "dashed") +
+  geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dotted") +
+  labs(
+    title = "Actual vs Forecasted Prescriptions (ETS)",
+    subtitle = "Blue = Actual, Green = Forecast (pre-2020 ETS)",
+    x = "Date", y = "Prescriptions"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+res_train <- residuals(fit)
+res_test <- test_data$prescriptions - as.numeric(forecast_result$mean)
+
+residuals_df <- bind_rows(
+  tibble(month = train_data$month, residual = res_train, period = "train"),
+  tibble(month = test_data$month, residual = res_test, period = "test")
+)
+
+
+ttest <- t.test(
+  residuals_df$residual[residuals_df$period == "train"],
+  residuals_df$residual[residuals_df$period == "test"]
+)
+
+print(ttest)
+```
+
+# Residuals by sex and vacc
+
+```{r}
+analyze_group <- function(df, group_id, group_type) {
+  monthly_data <- df %>%
+    mutate(month = floor_date(presc_date, "month")) %>%
+    group_by(month) %>%
+    summarise(prescriptions = sum(count), .groups = 'drop') %>%
+    arrange(month)
+
+  train_data <- monthly_data %>% filter(month < as.Date("2020-01-01"))
+  test_data  <- monthly_data %>% filter(month >= as.Date("2020-01-01"))
+
+  if (nrow(train_data) < 24 || nrow(test_data) < 12) {
+    return(NULL)
+  }
+
+  ts_train <- ts(train_data$prescriptions, start = c(2015, 1), frequency = 12)
+
+  fit <- tryCatch(ets(ts_train), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+
+  model_type <- fit$method  # e.g. "ETS(A,A,N)"
+
+  forecast_result <- forecast(fit, h = nrow(test_data))
+  residuals_train <- residuals(fit)
+  residuals_test <- test_data$prescriptions - as.numeric(forecast_result$mean)
+
+  ttest <- t.test(residuals_train, residuals_test)
+  rmse <- sqrt(mean(residuals_test^2))
+  
+  mean_train <- mean(train_data$prescriptions)
+  rrmse <- rmse / mean_train
+
+  plot_data <- bind_rows(
+    train_data %>% mutate(predicted = as.numeric(fitted(fit))),
+    test_data %>% mutate(predicted = as.numeric(forecast_result$mean))
+  ) %>%
+    mutate(group = group_id, group_type = group_type)
+
+  tibble(
+    group = group_id,
+    group_type = group_type,
+    model = model_type,
+    rmse = rmse,
+    rrmse = rrmse,
+    t_stat = ttest$statistic,
+    p_value = ttest$p.value,
+    mean_train_resid = mean(residuals_train),
+    mean_test_resid = mean(residuals_test),
+    plot_data = list(plot_data)
+  )
+}
+
+# Vaccinated groups
+results_vacc <- prescriptions_clean %>%
+  filter(!is.na(vaccinated)) %>%
+  group_by(vaccinated) %>%
+  group_split() %>%
+  map(~ {
+    group_val <- unique(.x$vaccinated)
+    analyze_group(df = filter(prescriptions_clean, vaccinated == group_val), 
+                  group_id = group_val, 
+                  group_type = "Vaccination")
+  }) %>%
+  compact() %>%
+  bind_rows()
+
+# Sex groups
+results_sex <- prescriptions_clean %>%
+  filter(!is.na(sex)) %>%
+  group_by(sex) %>%
+  group_split() %>%
+  map(~ {
+    group_val <- unique(.x$sex)
+    analyze_group(df = filter(prescriptions_clean, sex == group_val), 
+                  group_id = group_val, 
+                  group_type = "Sex")
+  }) %>%
+  compact() %>%
+  bind_rows()
+
+results_all <- bind_rows(results_vacc, results_sex) %>%
+  arrange(p_value)
+
+print(results_all %>% select(group_type, group, model, rmse, rrmse, t_stat, p_value, mean_train_resid, mean_test_resid))
+
+plot_data_all <- results_all %>%
+  unnest(plot_data, names_sep = "_")
+
+ggplot(plot_data_all, aes(x = plot_data_month)) +
+  geom_line(aes(y = plot_data_prescriptions), color = "blue") +
+  geom_line(aes(y = plot_data_predicted), color = "red", linetype = "dashed") +
+  geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dotted") +
+  facet_wrap(~ paste(plot_data_group_type, plot_data_group, sep = ": "), scales = "free_y") +
+  labs(
+    title = "Actual vs Forecasted Prescriptions by Group",
+    subtitle = "Blue = Actual, Red = Forecast (pre-2020 ETS)",
+    x = "Date", y = "Prescriptions"
+  ) +
+  theme_minimal()
+
+
+plot_longer <- pivot_longer(plot_data_all,values_to = "value", names_to = "name", cols = c("plot_data_prescriptions", "plot_data_predicted"))
+
+
+ggplot(plot_longer, aes(x = plot_data_month, y = value, color = name)) +
+  geom_line(alpha = 0.2) +
+  geom_smooth(data = plot_longer %>% filter(plot_data_month < '2020-01-01'), se = F, method = "lm") +
+    geom_smooth(data = plot_longer %>% filter(plot_data_month > '2020-01-01'), se = F, method = "lm") +
+  geom_vline(xintercept = as.Date("2020-01-01"), linetype = "dotted") +
+  facet_wrap(~ paste(plot_data_group_type, plot_data_group, sep = ": "), scales = "free_y") +
+  labs(
+    title = "Actual vs Forecasted Prescriptions by Group",
+    subtitle = "Blue = Actual, Red = Forecast (pre-2020 ETS)",
+    x = "Date", y = "Prescriptions"
+  ) +
+  theme_minimal()
+```
+
+## Prvopředpisy
+Prvopředpisy celkem mají viditelný rozdíl v porovnání před-covidového a po-covidového období. Tento nárůst ale může být vysvětlen jen stárnutím populace.
+```{r, echo=FALSE}
+first_presc <- dbGetQuery(con,
+                          "
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.date ASC) AS first_presc_date,
+                            'CPZP' AS ins_company
+                          FROM
+                            cpzp_clients c
+                          LEFT JOIN cpzp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN cpzp_prescriptions p ON c.client_id = p.client_id AND p.presc_order = 1
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date = '9999-12-31'
+                            AND 2021 - c.birthyear BETWEEN 12 AND 15
+                            
+                          UNION
+                          
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.date ASC) AS first_presc_date,
+                            'OZP' AS ins_company
+                          FROM
+                            ozp_clients c
+                          LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN ozp_prescriptions p ON c.client_id = p.client_id AND p.presc_order = 1
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date IS NULL
+                            AND 2021 - c.birthyear BETWEEN 12 AND 15
+                          ") %>%
+  mutate(first_presc_yearmonth = floor_date(first_presc_date, unit = "month"),
+         sex = ifelse(sex == "Z", "F", sex),
+         vacc_status = ifelse(n_vacc > 0, "Vaccinated", "Non-vaccinated"),
+         age_2021 = 2021 - birthyear)
+
+monthly_first_presc <- first_presc %>%
+  count(first_presc_yearmonth, name = "new_prescriptions") %>%
+  arrange(first_presc_yearmonth) %>%
+  mutate(
+    cum_new_presc = cumsum(new_prescriptions),  
+    total_population = nrow(first_presc),
+    at_risk_population = total_population - lag(cum_new_presc, default = 0),
+    rate = new_prescriptions / at_risk_population
+  ) %>%
+  mutate(
+    period_group = case_when(
+      first_presc_yearmonth < as.Date("2020-01-01") ~ "Pre-COVID",
+      first_presc_yearmonth > as.Date("2021-12-31") ~ "Post-COVID",
+      TRUE ~ "COVID-Shock"
+    )
+  )
+
+monthly_clean <- monthly_first_presc %>%
+  filter(first_presc_yearmonth >= as.Date("2018-01-01")) %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID"))
+
+t.test(rate ~ period_group, data = monthly_clean)
+
+ggplot(monthly_first_presc %>% filter(first_presc_yearmonth >= as.Date("2018-01-01")),
+       aes(x = first_presc_yearmonth, y = rate * 1000)) +
+  geom_line(color = "steelblue", size = 1) +
+  annotate("rect",
+           xmin = as.Date("2020-01-01"), xmax = as.Date("2021-12-31"),
+           ymin = -Inf, ymax = Inf, alpha = 0.2, fill = "gray50") +
+  scale_y_continuous(name = "Prescriptions per 1,000 at-risk clients", limits = c(0, 7)) +
+  labs(
+    title = "First Prescription Rate Over Time (General Population)",
+    subtitle = "Gray area = COVID disruption window (excluded from t-test)",
+    x = "Year-Month"
+  ) +
+  theme_minimal()
+
+total_by_vacc <- first_presc %>%
+  count(vacc_status, name = "total_population")
+```
+
+Rozdíl mezi prvopředpisovostí očkovaných a neočkovaných je naprosto minimální.
+```{r, echo=FALSE}
+monthly_by_vacc <- first_presc %>%
+  count(vacc_status, first_presc_yearmonth, name = "new_prescriptions") %>%
+  arrange(vacc_status, first_presc_yearmonth) %>%
+  group_by(vacc_status) %>%
+  mutate(
+    cum_prescriptions = cumsum(new_prescriptions),
+    total_population = total_by_vacc$total_population[match(vacc_status, total_by_vacc$vacc_status)],
+    at_risk_population = total_population - lag(cum_prescriptions, default = 0),
+    rate = new_prescriptions / at_risk_population
+  ) %>%
+  ungroup() %>%
+  mutate(
+    period_group = case_when(
+      first_presc_yearmonth < as.Date("2020-01-01") ~ "Pre-COVID",
+      first_presc_yearmonth > as.Date("2021-12-31") ~ "Post-COVID",
+      TRUE ~ "COVID-Shock"
+    )
+  )
+  
+monthly_by_vacc_clean <- monthly_by_vacc %>%
+  filter(first_presc_yearmonth >= as.Date("2018-01-01")) %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID"))
+
+monthly_by_vacc_clean %>%
+  group_by(vacc_status) %>%
+  summarise(
+    p_value = t.test(rate ~ period_group)$p.value,
+    mean_before = mean(rate[period_group == "Pre-COVID"]),
+    mean_after = mean(rate[period_group == "Post-COVID"]),
+    rate = mean_after / mean_before
+  )
+
+ggplot(monthly_by_vacc %>% filter(first_presc_yearmonth >= as.Date("2018-01-01")),
+       aes(x = first_presc_yearmonth, y = rate * 1000, color = vacc_status)) +
+  geom_line(size = 1) +
+  annotate("rect",
+           xmin = as.Date("2020-01-01"), xmax = as.Date("2021-12-31"),
+           ymin = -Inf, ymax = Inf, alpha = 0.2, fill = "gray50") +
+  scale_y_continuous(name = "Prescriptions per 1,000 at-risk clients", limits = c(0, 7)) +
+  labs(
+    title = "First Prescription Rate Over Time by Vaccination Status",
+    subtitle = "Gray area = COVID disruption window (excluded from t-tests)",
+    x = "Year-Month",
+    color = "Vaccination Status"
+  ) +
+  theme_minimal()
+
+```
+A není statisticky významný (p = 0,41)
+```{r, echo=FALSE}
+monthly_rates <- monthly_by_vacc %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID")) %>%
+  mutate(
+    vaccinated = if_else(vacc_status == "Vaccinated", 1, 0),
+    post_covid = if_else(first_presc_yearmonth >= as.Date("2022-01-01"), 1, 0),
+    interaction = vaccinated * post_covid)
+
+did_model <- lm(log(rate * 1000) ~ vaccinated * post_covid, data = monthly_rates)
+summary(did_model)
+```
+
+## Dá se nárůst všech předpisů vysvětlit pouze stoupající mírou prvopředpisovosti nebo je na vině multipředpisovost?
+Počet unikátních klientů stále roste. To nemusí být nutně alarmující, pokud je míra multipředpisovosti stále stejná a do dalších let "zůstává" stále stejné relativní množství klientů.
+```{r, echo=FALSE}
+presc_id_counts <- dbGetQuery(con,
+                          "
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            2021 - c.birthyear AS age_2021,
+                            p.date as presc_date,
+                            p.presc_order,
+                            'CPZP' AS ins_company,
+                            YEAR(FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.presc_order ASC)) AS first_presc_year
+                          FROM
+                            cpzp_clients c
+                          LEFT JOIN cpzp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN cpzp_prescriptions p ON c.client_id = p.client_id
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date = '9999-12-31'
+                            AND 2021 - c.birthyear BETWEEN 12 AND 15
+                            
+                          UNION
+                          
+                          SELECT
+                            c.client_id,
+                            c.n_vacc,
+                            c.n_presc,
+                            c.sex,
+                            c.birthyear,
+                            2021 - c.birthyear AS age_2021,
+                            p.date as presc_date,
+                            p.presc_order,
+                            'OZP' AS ins_company,
+                            YEAR(FIRST(p.date) OVER (PARTITION BY c.client_id ORDER BY p.presc_order ASC)) AS first_presc_year
+                          FROM
+                            ozp_clients c
+                          LEFT JOIN ozp_ins_start_end i ON c.client_id = i.client_id
+                          LEFT JOIN ozp_prescriptions p ON c.client_id = p.client_id
+                          WHERE
+                            i.ins_start_date < '2015-01-01' AND i.ins_end_date IS NULL
+                            AND 2021 - c.birthyear BETWEEN 12 AND 15
+                          ")%>%
+  mutate(presc_year = as.integer(format(as.Date(presc_date), "%Y")))
+
+monthly_unique_clients <- presc_id_counts %>%
+  mutate(yearmonth = floor_date(presc_date, unit = "month")) %>%
+  distinct(client_id, yearmonth) %>%
+  count(yearmonth, name = "n_unique_clients")
+
+ggplot(monthly_unique_clients %>% filter(yearmonth > '2016-01-01'), aes(x = yearmonth, y = n_unique_clients)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(size = 1.5) +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred", linewidth = 1) +
+  labs(
+    title = "Unique Prescribed Clients by Year-Month",
+    x = "Year-Month",
+    y = "Number of Unique Clients"
+  ) +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "3 months", expand = c(0, 0)) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Podíl prvopředpisů v čase neustále klesá
+```{r, echo=FALSE}
+ratios_df <- presc_id_counts %>%
+  group_by(presc_year) %>%
+  summarise(
+    n_first_time = n_distinct(client_id[first_presc_year == presc_year]),
+    n_previous = n_distinct(client_id[first_presc_year < presc_year])
+  ) %>%
+  filter(presc_year %in% 2017:2023) %>%
+  mutate(
+    ratio = n_first_time / n_previous
+  )
+
+ggplot(ratios_df, aes(x = presc_year, y = ratio)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(size = 2, color = "darkblue") +
+  labs(
+    title = "Ratio of First-Prescriptions vs Multiprescriptions (2017–2023)",
+    x = "Year",
+    y = "Ratio (First-time / Returning)"
+  ) +
+  theme_minimal()
+```
+
+Míra "udržení" klienta v čase kolísá. Dá se ale všeobecně říct, že 11-15 % klientů neskončí na prvním předpisu.
+```{r, echo=FALSE}
+presc_years <- presc_id_counts %>%
+  mutate(
+    presc_year = year(presc_date)
+  ) %>%
+  distinct(client_id, first_presc_year, presc_year) %>%
+  filter(first_presc_year >= 2017, first_presc_year <= 2023)
+
+
+retention_data <- presc_years %>%
+  mutate(year_offset = presc_year - first_presc_year) %>%
+  filter(year_offset >= 0)
+
+
+retention_summary <- retention_data %>%
+  group_by(first_presc_year, year_offset) %>%
+  summarise(n_clients = n_distinct(client_id), .groups = "drop")
+
+
+cohort_sizes <- retention_data %>%
+  filter(year_offset == 0) %>%
+  group_by(first_presc_year) %>%
+  summarise(cohort_size = n_distinct(client_id), .groups = "drop")
+
+
+retention_summary <- retention_summary %>%
+  left_join(cohort_sizes, by = "first_presc_year") %>%
+  mutate(retention_rate = n_clients / cohort_size)
+
+retention_summary_filtered <- retention_summary %>%
+  filter(year_offset > 0)
+
+ggplot(retention_summary_filtered, aes(x = year_offset, y = retention_rate, color = as.factor(first_presc_year))) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_color_viridis_d(name = "First Prescription Year") +
+  labs(
+    title = "Retention by First Prescription Year (Excluding Year 0)",
+    x = "Years Since First Prescription",
+    y = "Retention Rate"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Doba mezi prvním a druhým předpisem se v čase snižuje. Pro roky 2020, 2021 a 2022 statisticky významně
+```{r, echo=FALSE}
+multi_presc <- dbGetQuery(con,
+                          "
+                          SELECT
+                          p.client_id,
+                          p.date,
+                          p.presc_order,
+                          IF(c.n_vacc > 0, 'Vaccinated', 'Non-vaccinated') AS vacc_status
+                          FROM
+                          ozp_prescriptions p
+                          INNER JOIN ozp_clients c ON p.client_id = c.client_id AND 2021 - c.birthyear BETWEEN 12 AND 15
+                          INNER JOIN ozp_ins_start_end i ON p.client_id = i.client_id
+                                                         AND i.ins_start_date < '2015-01-01'
+                                                         AND i.ins_end_date IS NULL
+
+                          
+                          UNION
+                          
+                          SELECT
+                          p.client_id,
+                          p.date,
+                          p.presc_order,
+                          IF(c.n_vacc > 0, 'Vaccinated', 'Non-vaccinated') AS vacc_status
+                          FROM
+                          cpzp_prescriptions p
+                          INNER JOIN cpzp_clients c ON p.client_id = c.client_id AND 2021 - c.birthyear BETWEEN 12 AND 15
+                          INNER JOIN cpzp_ins_start_end i ON p.client_id = i.client_id
+                                                         AND i.ins_start_date < '2015-01-01'
+                                                         AND i.ins_end_date = '9999-12-31'
+
+                          ")
+
+multi_clean <- multi_presc %>%
+  filter(presc_order %in% 1:2) %>%
+  arrange(client_id, date)
+
+multi_wide <- multi_clean %>%
+  pivot_wider(
+    names_from = presc_order,
+    values_from = date,
+    names_prefix = "presc_"
+  ) %>%
+  rename(first_presc_date = presc_1, second_presc_date = presc_2) %>%
+  mutate(
+    first_presc_year = as.integer(format(first_presc_date, "%Y")),
+    time_to_second = as.numeric(difftime(second_presc_date, first_presc_date, units = "days")),
+    event = ifelse(!is.na(second_presc_date), 1, 0)
+  )
+
+surv_data <- multi_wide %>%
+  filter(first_presc_year >= 2017, first_presc_year <= 2022)
+
+surv_data <- multi_wide %>%
+  filter(first_presc_year >= 2017, first_presc_year <= 2022) %>%
+  mutate(
+    time = pmin(time_to_second, 270, na.rm = TRUE),
+    event = ifelse(!is.na(second_presc_date) & time_to_second <= 270, 1, 0)
+  )
+
+surv_data$first_presc_year <- factor(surv_data$first_presc_year)
+surv_data$first_presc_year <- relevel(surv_data$first_presc_year, ref = "2017")
+
+cox_model <- coxph(Surv(time, event) ~ first_presc_year, data = surv_data)
+
+summary(cox_model)
+```
+
+```{r, fig.height=12, fig.width=10}
+fit <- survfit(Surv(time, event) ~ first_presc_year, data = surv_data)
+
+ggsurvplot(
+  fit,
+  data = surv_data,
+  conf.int = FALSE,
+  risk.table = FALSE,
+  pval = TRUE,
+  legend.title = "First Prescription Year",
+  xlab = "Days since first prescription",
+  ylab = "Still mono-prescribed (%)",
+  title = "Time to Second Prescription (Censored at 270 days)",
+  palette = "Dark2",
+  ylim = c(0.7, 1)
+)
+```
+
+Počet předpisů multipředpisovnaých klientů za rok
+```{r, echo=FALSE}
+multi_presc_clients <- multi_presc %>%
+  mutate(year = lubridate::year(date)) %>%
+  group_by(client_id, year) %>%
+  filter(n() > 1) %>%
+  ungroup() %>%
+  group_by(year) %>%
+  summarise(
+    total_prescriptions = n(),
+    repeat_clients = n_distinct(client_id)
+  )
+
+ggplot(multi_presc_clients, aes(x = year, y = repeat_clients)) +
+  geom_line(size = 1.2, color = "steelblue") +
+  geom_point(size = 2) +
+  scale_y_continuous(name = "Amount of Multi-Prescribed Clients Per Year") +
+  labs(
+    title = "Multi-Prescribed Clients Per Year",
+    x = "Year"
+  ) +
+  theme_minimal()
+
+
+multi_presc_summary <- multi_presc %>%
+  mutate(year = lubridate::year(date)) %>%
+  group_by(client_id) %>%
+  filter(n() > 1) %>%
+  ungroup() %>%
+  group_by(year) %>%
+  summarise(
+    total_prescriptions = n(),
+    repeat_clients = n_distinct(client_id),
+    avg_presc_per_client = total_prescriptions / repeat_clients
+  )
+
+ggplot(multi_presc_summary, aes(x = year, y = avg_presc_per_client)) +
+  geom_line(size = 1.2, color = "steelblue") +
+  geom_point(size = 2) +
+  scale_y_continuous(name = "Avg. prescriptions per repeat client") +
+  labs(
+    title = "Frequency of Multi-Prescriptions Over Time",
+    x = "Year"
+  ) +
+  theme_minimal()
+```
+
+Roční míra multipředpisovosti - Počítáno vždy pro daný rok - tj. kolik předpisovaných lidí v daném roce bylo multipředpisovaných na 1000 předpisovaných
+
+Výsledek není statisticky významný
+```{r, echo=FALSE}
+
+multi_presc_yearly <- multi_presc %>%
+  mutate(year = year(date)) %>%
+  filter(year > 2017)
+
+
+multi_clients_yearly <- multi_presc_yearly %>%
+  group_by(year, vacc_status, client_id) %>%
+  summarise(presc_count = n(), .groups = "drop") %>%
+  mutate(is_multi = presc_count > 1)
+
+
+multi_summary_yearly <- multi_clients_yearly %>%
+  group_by(year, vacc_status) %>%
+  summarise(
+    total_clients = n(),
+    multi_clients = sum(is_multi),
+    multi_rate = (multi_clients / total_clients) * 1000,
+    .groups = "drop"
+  )
+
+
+multi_summary_yearly <- multi_summary_yearly %>%
+  mutate(
+    period_group = case_when(
+      year < 2020 ~ "Pre-COVID",
+      year > 2021 ~ "Post-COVID",
+      TRUE ~ "COVID-Shock"
+    )
+  )
+
+
+multi_summary_clean <- multi_summary_yearly %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID"))
+
+
+t_test_results <- multi_summary_clean %>%
+  group_by(vacc_status) %>%
+  summarise(
+    p_value = t.test(multi_rate ~ period_group)$p.value,
+    mean_before = mean(multi_rate[period_group == "Pre-COVID"]),
+    mean_after = mean(multi_rate[period_group == "Post-COVID"]),
+    rate = mean_after / mean_before,
+    .groups = "drop"
+  )
+
+print(t_test_results)
+
+
+ggplot(multi_summary_yearly, aes(x = year, y = multi_rate, color = vacc_status)) +
+  geom_line(size = 0.6, alpha = 0.4) +  # Subtle lines
+  stat_smooth(method = "loess", se = FALSE, size = 1.2) +  # Smooth trend
+  annotate("rect",
+           xmin = 2020, xmax = 2021,
+           ymin = -Inf, ymax = Inf,
+           alpha = 0.2, fill = "gray50") +
+  scale_y_continuous(name = "Yearly multi-prescription rate per 1,000 clients") +
+  scale_x_continuous(breaks = unique(multi_summary_yearly$year)) +
+  labs(
+    title = "Yearly Multi-Prescription Rate by Vaccination Status",
+    subtitle = "Gray area = COVID disruption window (excluded from t-tests)",
+    x = "Year",
+    color = "Vaccination Status"
+  ) +
+  theme_minimal()
+
+
+did_data <- multi_summary_clean %>%
+  mutate(
+    vaccinated = if_else(vacc_status == "Vaccinated", 1, 0),
+    post_covid = if_else(year >= 2022, 1, 0),
+    interaction = vaccinated * post_covid
+  )
+
+did_model <- lm(log(multi_rate) ~ vaccinated * post_covid, data = did_data)
+summary(did_model)
+```
+
+Měsíční míra multipředpisovosti. Statisticky významný rozdíl mezi očko a neočko.
+```{r, echo=FALSE}
+multi_presc <- multi_presc %>%
+  mutate(year_month = floor_date(date, unit = "month"))
+
+multi_clients_by_month <- multi_presc %>%
+  group_by(year_month, vacc_status, client_id) %>%
+  summarise(presc_count = n(), .groups = "drop") %>%
+  mutate(is_multi = presc_count > 1)
+
+
+multi_summary_monthly <- multi_clients_by_month %>%
+  filter(year_month > "2017-12-31") %>%
+  group_by(year_month, vacc_status) %>%
+  summarise(
+    total_clients = n(),
+    multi_clients = sum(is_multi),
+    multi_rate = (multi_clients / total_clients) * 1000,
+    .groups = "drop"
+  )
+
+
+multi_summary_monthly <- multi_summary_monthly %>%
+  mutate(
+    period_group = case_when(
+      year_month < as.Date("2020-01-01") ~ "Pre-COVID",
+      year_month > as.Date("2021-12-31") ~ "Post-COVID",
+      TRUE ~ "COVID-Shock"
+    )
+  )
+
+
+multi_summary_clean <- multi_summary_monthly %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID"))
+
+
+t_test_results <- multi_summary_clean %>%
+  group_by(vacc_status) %>%
+  summarise(
+    p_value = t.test(multi_rate ~ period_group)$p.value,
+    mean_before = mean(multi_rate[period_group == "Pre-COVID"]),
+    mean_after = mean(multi_rate[period_group == "Post-COVID"]),
+    rate = mean_after / mean_before
+  )
+
+print(t_test_results)
+
+
+ggplot(multi_summary_monthly, aes(x = year_month, y = multi_rate, color = vacc_status)) +
+  geom_line(size = 0.5, alpha = 0.4) + 
+  stat_smooth(method = "loess", se = FALSE, size = 1.2) +  
+  annotate("rect",
+           xmin = as.Date("2020-01-01"), xmax = as.Date("2021-12-31"),
+           ymin = -Inf, ymax = Inf, alpha = 0.2, fill = "gray50") +
+  scale_y_continuous(name = "Monthly multi-prescription rate per 1,000 clients") +
+  labs(
+    title = "Monthly Multi-Prescription Rate by Vaccination Status",
+    subtitle = "Gray area = COVID disruption window (excluded from t-tests)",
+    x = "Year-Month",
+    color = "Vaccination Status"
+  ) +
+  theme_minimal()
+
+
+did_data <- multi_summary_clean %>%
+  mutate(
+    vaccinated = if_else(vacc_status == "Vaccinated", 1, 0),
+    post_covid = if_else(year_month >= as.Date("2022-01-01"), 1, 0),
+    interaction = vaccinated * post_covid
+  )
+
+did_model <- lm(log(multi_rate) ~ vaccinated * post_covid, data = did_data)
+summary(did_model)
+```
+
+Kategorizace klientů na základě počtu předpisů v daném roce
+```{r, echo=FALSE}
+yearly_presc_counts <- multi_presc %>%
+  mutate(year = year(date)) %>%
+  group_by(year, client_id, vacc_status) %>%
+  summarise(presc_count = n(), .groups = "drop")
+
+yearly_presc_counts <- yearly_presc_counts %>%
+  mutate(presc_category = case_when(
+    presc_count == 1 ~ "1",
+    presc_count == 2 ~ "2",
+    presc_count == 3 ~ "3",
+    presc_count == 4 ~ "4",
+    presc_count >= 5 ~ "5+"
+  ))
+
+presc_category_summary <- yearly_presc_counts %>%
+  group_by(year, vacc_status, presc_category) %>%
+  summarise(client_count = n(), .groups = "drop")
+
+ggplot(presc_category_summary, aes(x = year, y = client_count, fill = presc_category)) +
+  geom_bar(stat = "identity", position = "fill") +  # Use position = "fill" for proportions
+  facet_wrap(~ vacc_status) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "Blues", direction = 1) +
+  labs(
+    title = "Distribution of Yearly Prescription Categories by Vaccination Status",
+    x = "Year",
+    y = "Proportion of Clients",
+    fill = "Prescription Count Category"
+  ) +
+  theme_minimal()
+
+ggplot(presc_category_summary %>% filter(presc_category != "1"), aes(x = year, y = client_count, fill = presc_category)) +
+  geom_bar(stat = "identity", position = "fill") +  # Use position = "fill" for proportions
+  facet_wrap(~ vacc_status) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "Blues", direction = 1) +
+  labs(
+    title = "Distribution of Yearly Prescription Categories by Vaccination Status",
+    x = "Year",
+    y = "Proportion of Clients",
+    fill = "Prescription Count Category"
+  ) +
+  theme_minimal()
+```
+
+Intervaly mezi předpisy
+```{r, echo=FALSE}
+multi_presc_delays <- multi_presc %>%
+  arrange(client_id, date) %>%
+  mutate(
+    year = year(date),
+    next_date = lead(date),
+    next_client = lead(client_id),
+    vacc_status_next = lead(vacc_status)
+  ) %>%
+  filter(year >= 2019)
+
+multi_presc_delays <- multi_presc_delays %>%
+  filter(client_id == next_client) %>%
+  mutate(
+    delay_days = as.numeric(next_date - date),
+    period_group = case_when(
+      year < 2020 ~ "Pre-COVID",
+      year > 2021 ~ "Post-COVID",
+      TRUE ~ "COVID-Shock"
+    )
+  ) %>%
+  filter(delay_days < 365, year < 2023)
+
+delay_summary <- multi_presc_delays %>%
+  group_by(year, vacc_status) %>%
+  summarise(
+    mean_delay = mean(delay_days),
+    median_delay = median(delay_days),
+    sd_delay = sd(delay_days),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+ggplot(delay_summary, aes(x = year, y = mean_delay, color = vacc_status)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  annotate("rect",
+           xmin = 2020, xmax = 2021,
+           ymin = -Inf, ymax = Inf,
+           alpha = 0.2, fill = "gray50") +
+  labs(
+    title = "Mean Delay Between Prescriptions (Consecutive, Client-Level)",
+    subtitle = "Based on date of earlier prescription (gray = COVID disruption)",
+    x = "Year of First Prescription",
+    y = "Mean Delay to Next Prescription (days)",
+    color = "Vaccination Status"
+  ) +
+  theme_minimal()
+
+delay_test_data <- multi_presc_delays %>%
+  filter(period_group %in% c("Pre-COVID", "Post-COVID"))
+
+delay_ttest_results <- delay_test_data %>%
+  group_by(vacc_status) %>%
+  summarise(
+    p_value = t.test(delay_days ~ period_group)$p.value,
+    mean_pre = mean(delay_days[period_group == "Pre-COVID"]),
+    mean_post = mean(delay_days[period_group == "Post-COVID"]),
+    rate = mean_post / mean_pre,
+    .groups = "drop"
+  )
+
+print(delay_ttest_results)
+
+
+did_model_data <- delay_test_data %>%
+  mutate(
+    vaccinated = if_else(vacc_status == "Vaccinated", 1, 0),
+    post_covid = if_else(year >= 2022, 1, 0),
+    interaction = vaccinated * post_covid
+  )
+
+did_model <- lm(delay_days ~ vaccinated * post_covid, data = did_model_data)
+summary(did_model)
+```
+
+# Největší vliv na celkový úhrn předpisů má multipředpisovost. V dlouhodobém horizontu na ni očkování vliv nemá a nebo ho má jen minimální.
+
+## Podíl způsobu podání na celkovém úhrnu
+```{r}
+prescriptions <- prescriptions %>%
+  mutate(
+    drug_form_std = case_when(
+      is.na(drug_form) ~ NA_character_,
+      str_detect(drug_form, "tableta|Tableta") ~ "Tablet",
+      str_detect(drug_form, "tobolka|Tobolka") ~ "Capsule",
+      str_detect(drug_form, "injekční|Injekční|infuzní|Infuzní") ~ "Injection/Infusion",
+      str_detect(drug_form, "č[íi]pek|Čípek") ~ "Suppository",
+      str_detect(drug_form, "perorální roztok|Perorální roztok") ~ "Oral Solution",
+      TRUE ~ "Other"
+    )
+  )
+
+prescriptions <- prescriptions %>%
+  mutate(
+    year = year(presc_date)
+  )
+
+ggplot(prescriptions %>% filter(!is.na(presc_date), !is.na(drug_form)), aes(x = factor(year), fill = drug_form_std)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Drug Form Ratios Over Time",
+    x = "Year",
+    y = "Percentage of Prescriptions",
+    fill = "Drug Form"
+  ) +
+  theme_minimal()
+
+client_yearly_counts <- prescriptions %>%
+  filter(!is.na(presc_date), !is.na(drug_form)) %>%
+  group_by(client_id, year, drug_form_std) %>%
+  summarise(presc_count = n(), .groups = "drop")
+
+average_freq_per_year <- client_yearly_counts %>%
+  group_by(year, drug_form_std) %>%
+  summarise(avg_presc_per_client = mean(presc_count), .groups = "drop")
+
+ggplot(average_freq_per_year, aes(x = factor(year), y = avg_presc_per_client, fill = drug_form_std)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Average Yearly Prescriptions per Client by Drug Form",
+    x = "Year",
+    y = "Avg Prescriptions per Client",
+    fill = "Drug Form"
+  ) +
+  theme_minimal()
+```
+
+## Podíl způsobu podání u prvopředpisů
+```{r}
+ggplot(prescriptions %>% filter(!is.na(presc_date), !is.na(drug_form), first_presc_flag == 1, year > 2016), aes(x = factor(year), fill = drug_form_std)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Drug Form Ratios Over Time",
+    x = "Year",
+    y = "Percentage of Prescriptions",
+    fill = "Drug Form"
+  ) +
+  theme_minimal()
+```
+
+## Prednisonolove ekvivalenty
+```{r}
+# Step 1–3: Filter and compute prednisone-equivalent dose
+strength_data <- prescriptions %>%
+  filter(!is.na(prednison_equiv), !is.na(strength), !is.na(drug_form_std), !is.na(presc_yearmonth)) %>%
+  mutate(
+    # Step 2: Convert strength to numeric
+    strength_num = as.numeric(gsub(",", ".", gsub("[^0-9.,]", "", strength))),  # handles "5 mg", "0,5", etc.
+    dose_equiv = prednison_equiv * strength_num
+  ) %>%
+  filter(!is.na(strength_num), !is.na(dose_equiv))
+
+# Step 4–5: Group and calculate averages
+avg_dose_by_form <- strength_data %>%
+  group_by(presc_yearmonth, drug_form_std) %>%
+  summarise(
+    avg_dose_equiv = mean(dose_equiv, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(drug_form_std %in% c("Tablet", "Injection/Infusion"))
+
+ggplot(avg_dose_by_form, aes(x = presc_yearmonth, y = avg_dose_equiv, color = drug_form_std)) +
+  geom_line(size = 0.7) +
+  geom_smooth(se = FALSE, span = 0.3) +
+  labs(
+    title = "Average Prednisone-Equivalent Dose Over Time by Drug Form",
+    x = "Year-Month",
+    y = "Avg Prednisone-Equivalent Dose",
+    color = "Drug Form"
+  ) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year", expand = c(0.01, 0)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+dose_dist_data <- prescriptions %>%
+  filter(
+    drug_form_std %in% c("Tablet", "Injection/Infusion"),
+    !is.na(prednison_equiv),
+    !is.na(strength),
+    !is.na(presc_date)
+  ) %>%
+  mutate(
+    strength_num = as.numeric(gsub(",", ".", gsub("[^0-9.,]", "", strength))),
+    dose_equiv = prednison_equiv * strength_num,
+    year = year(presc_date)
+  ) %>%
+  filter(!is.na(dose_equiv), !is.na(year))
+
+ggplot(dose_dist_data, aes(x = factor(year), y = dose_equiv, fill = drug_form_std)) +
+  geom_violin(alpha = 0.5, scale = "width", trim = TRUE) +
+  labs(
+    title = "Distribution of Prednisone-Equivalent Dose by Year (Faceted by Drug Form)",
+    x = "Year",
+    y = "Dose Equivalent",
+    fill = "Drug Form"
+  ) +
+  facet_wrap(~ drug_form_std) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+filtered_data <- prescriptions %>%
+  mutate(
+    drug_form_std = ifelse(is.na(drug_form_std), "Unknown", drug_form_std)
+  ) %>%
+  filter(
+    drug_form_std %in% c("Injection/Infusion", "Tablet"),
+    !is.na(vaccinated),
+    !is.na(presc_yearmonth)
+  )
+
+form_vax_counts <- filtered_data %>%
+  group_by(presc_yearmonth, vaccinated, drug_form_std) %>%
+  summarise(n = n(), .groups = "drop")
+
+month_totals <- filtered_data %>%
+  group_by(presc_yearmonth, vaccinated) %>%
+  summarise(total = n(), .groups = "drop")
+
+form_vax_ratios <- form_vax_counts %>%
+  left_join(month_totals, by = c("presc_yearmonth", "vaccinated")) %>%
+  mutate(ratio = n / total)
+
+form_vax_ratios <- form_vax_ratios %>%
+  mutate(group = paste(drug_form_std, ifelse(vaccinated == "Vaccinated", "Vaccinated", "Unvaccinated"), sep = " - "))
+
+ggplot(form_vax_ratios, aes(x = presc_yearmonth, y = ratio, color = group)) +
+  geom_line(size = 0.6) +                   
+  geom_smooth(se = FALSE, span = 0.3) +   
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_date(date_labels = "%Y",         
+               date_breaks = "1 year",
+               expand = c(0.01, 0)) +
+  labs(
+    title = "Yearly Trends of Injection vs Tablet Use by Vaccination Status",
+    x = "Year",
+    y = "Ratio of Prescriptions",
+    color = "Drug Form + Vaccination"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+```
+
+# 2021 - 2024
+```{r}
+filtered_data <- prescriptions %>%
+  mutate(
+    drug_form_std = ifelse(is.na(drug_form_std), "Unknown", drug_form_std)
+  ) %>%
+  filter(
+    drug_form_std %in% c("Injection/Infusion", "Tablet"),
+    !is.na(vaccinated),
+    !is.na(presc_yearmonth),
+    presc_yearmonth > '2021-01-01'
+  )
+
+form_vax_counts <- filtered_data %>%
+  group_by(presc_yearmonth, vaccinated, drug_form_std) %>%
+  summarise(n = n(), .groups = "drop")
+
+month_totals <- filtered_data %>%
+  group_by(presc_yearmonth, vaccinated) %>%
+  summarise(total = n(), .groups = "drop")
+
+form_vax_ratios <- form_vax_counts %>%
+  left_join(month_totals, by = c("presc_yearmonth", "vaccinated")) %>%
+  mutate(ratio = n / total)
+
+form_vax_ratios <- form_vax_ratios %>%
+  mutate(group = paste(drug_form_std, ifelse(vaccinated == "Vaccinated", "Vaccinated", "Unvaccinated"), sep = " - "))
+
+ggplot(form_vax_ratios, aes(x = presc_yearmonth, y = ratio, color = group)) +
+  geom_line(size = 0.6) +                   # thinner lines
+  geom_smooth(se = FALSE, span = 0.3) +    # smooth trend, no confidence interval, tighter span
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_date(date_labels = "%Y",          # show only year on x-axis
+               date_breaks = "1 year",
+               expand = c(0.01, 0)) +
+  labs(
+    title = "Yearly Trends of Injection vs Tablet Use by Vaccination Status",
+    x = "Year",
+    y = "Ratio of Prescriptions",
+    color = "Drug Form + Vaccination"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+totals_unvaccinated <- form_vax_counts %>%
+  filter(vaccinated == "Not Vaccinated")
+
+ggplot(totals_unvaccinated, aes(x = presc_yearmonth, y = n, color = drug_form_std)) +
+  geom_line(size = 0.6) +                   
+  geom_smooth(se = FALSE, span = 0.3) +    
+  scale_x_date(date_labels = "%Y",          
+               date_breaks = "1 year",
+               expand = c(0.01, 0)) +
+  labs(
+    title = "Yearly Trends of Injection vs Tablet Use of Unvaccinated individuals",
+    x = "Year",
+    y = "Total Prescriptions",
+    color = "Drug Form"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+```
+
+```{r}
+multi_presc_persons <- prescriptions %>%
+  filter(n_presc > 100, n_vacc == 0)
+
+ggplot(multi_presc_persons, aes(x = presc_yearmonth, fill = drug_form_std)) +
+  geom_histogram()
+```
+
+### Krátkodobý vliv SCCS. Skupina 16-29 bohužel nemá dostatek dat pro statisticky významnou evaluaci. Rozšířeno na 16-39
+# Prvopředpisy
+```{r, echo=FALSE}
+combined_vaccinated_prescribed <- dbGetQuery(con,
+                                    "
+                                    SELECT
+                                    v.client_id,
+                                    v.date AS vaccination_date,
+                                    p.date AS event_date,
+                                    'CPZP' as ins_company
+                                    FROM cpzp_vaccinations v
+                                    LEFT JOIN cpzp_clients c ON v.client_id = c.client_id
+                                    LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
+                                    INNER JOIN cpzp_prescriptions p ON c.client_id = p.client_id
+                                                                    AND p.presc_order = 1
+                                                                    AND p.date BETWEEN v.date - INTERVAL '1 year' AND v.date + INTERVAL '1 year'
+                                    WHERE v.event_order = 1
+                                    AND s.ins_start_date < v.date - INTERVAL '1 year'
+                                    AND s.ins_end_date > v.date + INTERVAL '1 year'
+                                    AND v.date BETWEEN DATE '2021-06-07' - INTERVAL '7 days'
+                                                       AND DATE '2021-06-07' + INTERVAL '7 days'
+                                    AND 2021 - c.birthyear BETWEEN 12 AND 15
+                                    
+                                    UNION
+                                    
+                                    SELECT
+                                    v.client_id,
+                                    v.date AS vaccination_date,
+                                    p.date AS event_date,
+                                    'OZP' AS ins_company
+                                    FROM OZP_vaccinations v
+                                    LEFT JOIN ozp_clients c ON v.client_id = c.client_id
+                                    LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                                    INNER JOIN ozp_prescriptions p ON c.client_id = p.client_id
+                                                                    AND p.presc_order = 1
+                                                                    AND p.date BETWEEN v.date - INTERVAL '1 year' AND v.date + INTERVAL '1 year'
+                                    WHERE v.event_order = 1
+                                    AND s.ins_start_date < v.date - INTERVAL '1 year'
+                                    AND s.ins_end_date > v.date + INTERVAL '1 year'
+                                    AND v.date BETWEEN DATE '2021-06-07' - INTERVAL '7 days'
+                                                       AND DATE '2021-06-07' + INTERVAL '7 days'
+                                    AND 2021 - c.birthyear BETWEEN 12 AND 15
+                                    ") %>%
+  mutate(client_id = row_number()) %>%
+  transmute(
+    person_id = client_id,
+    exposure_start_date = vaccination_date,
+    event_date,
+    observation_start_date = vaccination_date - days(365),
+    observation_end_date = vaccination_date + days(365)
+  )
+
+sccs_vaccinated <- combined_vaccinated_prescribed %>%
+  mutate(
+    event_day = as.integer(event_date - observation_start_date),
+    exposure_start_day = as.integer(exposure_start_date - observation_start_date),
+    observation_start_day = 0,
+    observation_end_day = as.integer(observation_end_date - observation_start_date)
+  )
+
+sccs_result_vaccinated <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 90, 180, 270)),
+  data = sccs_vaccinated
+)
+
+print(sccs_result_vaccinated)
+
+combined_unvaccinated_prescribed <- dbGetQuery(con,
+                                               "
+                                    SELECT
+                                    p.client_id,
+                                    DATE '2021-06-07' AS vaccination_date,
+                                    p.date AS event_date,
+                                    'CPZP' as ins_company
+                                    FROM cpzp_prescriptions p
+                                    LEFT JOIN cpzp_clients c ON P.client_id = c.client_id 
+                                    LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
+                                    WHERE 1 = 1
+                                    AND s.ins_start_date < DATE '2021-06-07' - INTERVAL '1 year'
+                                    AND s.ins_end_date > DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND 2021 - c.birthyear BETWEEN 12 AND 15
+                                    AND p.date BETWEEN DATE '2021-06-07' - INTERVAL '1 year' AND DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND p.presc_order = 1
+                                    AND c.n_vacc = 0
+                                    
+                                    UNION
+                                    
+                                    SELECT
+                                    p.client_id,
+                                    DATE '2021-06-07' AS vaccination_date,
+                                    p.date AS event_date,
+                                    'OZP' as ins_company
+                                    FROM ozp_prescriptions p
+                                    LEFT JOIN ozp_clients c ON P.client_id = c.client_id 
+                                    LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                                    WHERE 1 = 1
+                                    AND s.ins_start_date < DATE '2021-06-07' - INTERVAL '1 year'
+                                    AND s.ins_end_date > DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND 2021 - c.birthyear BETWEEN 16 AND 39
+                                    AND p.date BETWEEN DATE '2021-06-07' - INTERVAL '1 year' AND DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND p.presc_order = 1
+                                    AND c.n_vacc = 0
+
+                                               ") %>%
+  mutate(client_id = row_number()) %>%
+  transmute(
+    person_id = client_id,
+    exposure_start_date = vaccination_date,
+    event_date,
+    observation_start_date = vaccination_date - days(365),
+    observation_end_date = vaccination_date + days(365)
+  )
+
+sccs_unvaccinated <- combined_unvaccinated_prescribed %>%
+  mutate(
+    event_day = as.integer(event_date - observation_start_date),
+    exposure_start_day = as.integer(exposure_start_date - observation_start_date),
+    observation_start_day = 0,
+    observation_end_day = as.integer(observation_end_date - observation_start_date)
+  )
+
+sccs_result_unvaccinated <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 90, 180, 270)),
+  data = sccs_unvaccinated
+)
+
+print(sccs_result_unvaccinated)
+
+
+coef_unvax <- sccs_result_unvaccinated$coefficients
+conf_unvax <- sccs_result_unvaccinated$conf.int
+
+df_unvax <- data.frame(
+  term = rownames(coef_unvax),
+  logHR = coef_unvax[, "coef"],
+  SE = coef_unvax[, "se(coef)"],
+  HR = coef_unvax[, "exp(coef)"],
+  conf.low = conf_unvax[, "lower .95"],
+  conf.high = conf_unvax[, "upper .95"]
+)
+
+coef_vax <- sccs_result_vaccinated$coefficients
+conf_vax <- sccs_result_vaccinated$conf.int
+
+df_vax <- data.frame(
+  term = rownames(coef_vax),
+  logHR = coef_vax[, "coef"],
+  SE = coef_vax[, "se(coef)"],
+  HR = coef_vax[, "exp(coef)"],
+  conf.low = conf_vax[, "lower .95"],
+  conf.high = conf_vax[, "upper .95"]
+)
+
+df_unvax <- df_unvax %>% mutate(group = "Unvaccinated")
+df_vax <- df_vax %>% mutate(group = "Vaccinated")
+
+combined <- bind_rows(df_vax, df_unvax)
+
+combined$period <- as.integer(gsub("exposure_start_day", "", combined$term))
+
+start_days <- c(0, 14, 28, 60, 90, 180, 270)
+end_days   <- c(13, 27, 59, 89, 179, 269, Inf)
+
+period_labels <- paste0(start_days, "-", ifelse(is.infinite(end_days), "+", end_days))
+
+combined$period_label <- factor(combined$period,
+                                levels = seq_along(period_labels),
+                                labels = period_labels)
+
+ggplot(combined, aes(x = period_label, y = HR, color = group)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2,
+                position = position_dodge(width = 0.6)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(
+    x = "Exposure Period (days)",
+    y = "Hazard Ratio (HR)",
+    title = "SCCS Vaccinated vs Unvaccinated Comparison"
+  ) +
+  theme_minimal()
+
+vax_df <- combined %>%
+  filter(group == "Vaccinated") %>%
+  rename_with(~ paste0(., "_vax"), -c(period, period_label))
+
+unvax_df <- combined %>%
+  filter(group == "Unvaccinated") %>%
+  rename_with(~ paste0(., "_unvax"), -c(period, period_label))
+
+df_diff <- inner_join(vax_df, unvax_df, by = c("period", "period_label"))
+
+df_diff <- df_diff %>%
+  mutate(
+    logHR_diff = logHR_vax - logHR_unvax,
+    se_diff = sqrt(SE_vax^2 + SE_unvax^2),
+    ci_low = logHR_diff - 1.96 * se_diff,
+    ci_high = logHR_diff + 1.96 * se_diff
+  )
+
+ggplot(df_diff, aes(x = period_label, y = logHR_diff)) +
+  geom_point(color = "blue", size = 3) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2, color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Difference in log(Hazard Ratio) (Vaccinated - Unvaccinated)",
+    x = "Exposure Period",
+    y = "Difference in log(Hazard Ratio)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Předpisy celkem
+```{r, echo=FALSE}
+combined_vaccinated_prescribed <- dbGetQuery(con,
+                                    "
+                                    SELECT
+                                    v.client_id,
+                                    v.date AS vaccination_date,
+                                    p.date AS event_date,
+                                    'CPZP' as ins_company
+                                    FROM cpzp_vaccinations v
+                                    LEFT JOIN cpzp_clients c ON v.client_id = c.client_id
+                                    LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
+                                    INNER JOIN cpzp_prescriptions p ON c.client_id = p.client_id
+                                                                    AND p.date BETWEEN v.date - INTERVAL '1 year' AND v.date + INTERVAL '1 year'
+                                    WHERE v.event_order = 1
+                                    AND s.ins_start_date < v.date - INTERVAL '1 year'
+                                    AND s.ins_end_date > v.date + INTERVAL '1 year'
+                                    AND v.date BETWEEN DATE '2021-06-07' - INTERVAL '7 days'
+                                                       AND DATE '2021-06-07' + INTERVAL '7 days'
+                                    AND 2021 - c.birthyear BETWEEN 12 AND 15
+                                    
+                                    UNION
+                                    
+                                    SELECT
+                                    v.client_id,
+                                    v.date AS vaccination_date,
+                                    p.date AS event_date,
+                                    'OZP' AS ins_company
+                                    FROM OZP_vaccinations v
+                                    LEFT JOIN ozp_clients c ON v.client_id = c.client_id
+                                    LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                                    INNER JOIN ozp_prescriptions p ON c.client_id = p.client_id
+                                                                    AND p.date BETWEEN v.date - INTERVAL '1 year' AND v.date + INTERVAL '1 year'
+                                    WHERE v.event_order = 1
+                                    AND s.ins_start_date < v.date - INTERVAL '1 year'
+                                    AND s.ins_end_date > v.date + INTERVAL '1 year'
+                                    AND v.date BETWEEN DATE '2021-06-07' - INTERVAL '7 days'
+                                                       AND DATE '2021-06-07' + INTERVAL '7 days'
+                                    AND 2021 - c.birthyear BETWEEN 12 AND 15
+                                    ") %>%
+  mutate(client_id = as.numeric(factor(client_id))) %>%
+  transmute(
+    person_id = client_id,
+    exposure_start_date = vaccination_date,
+    event_date,
+    observation_start_date = vaccination_date - days(365),
+    observation_end_date = vaccination_date + days(365)
+  )
+
+sccs_vaccinated <- combined_vaccinated_prescribed %>%
+  mutate(
+    event_day = as.integer(event_date - observation_start_date),
+    exposure_start_day = as.integer(exposure_start_date - observation_start_date),
+    observation_start_day = 0,
+    observation_end_day = as.integer(observation_end_date - observation_start_date)
+  )
+
+sccs_result_vaccinated <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 90, 180, 270)),
+  data = sccs_vaccinated
+)
+
+print(sccs_result_vaccinated)
+
+combined_unvaccinated_prescribed <- dbGetQuery(con,
+                                               "
+                                    SELECT
+                                    p.client_id,
+                                    DATE '2021-06-07' AS vaccination_date,
+                                    p.date AS event_date,
+                                    'CPZP' as ins_company
+                                    FROM cpzp_prescriptions p
+                                    LEFT JOIN cpzp_clients c ON P.client_id = c.client_id 
+                                    LEFT JOIN cpzp_ins_start_end s ON c.client_id = s.client_id
+                                    WHERE 1 = 1
+                                    AND s.ins_start_date < DATE '2021-06-07' - INTERVAL '1 year'
+                                    AND s.ins_end_date > DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND 2021 - c.birthyear BETWEEN 12 AND 15
+                                    AND p.date BETWEEN DATE '2021-06-07' - INTERVAL '1 year' AND DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND c.n_vacc = 0
+                                    
+                                    UNION
+                                    
+                                    SELECT
+                                    p.client_id,
+                                    DATE '2021-06-07' AS vaccination_date,
+                                    p.date AS event_date,
+                                    'OZP' as ins_company
+                                    FROM ozp_prescriptions p
+                                    LEFT JOIN ozp_clients c ON P.client_id = c.client_id 
+                                    LEFT JOIN ozp_ins_start_end s ON c.client_id = s.client_id
+                                    WHERE 1 = 1
+                                    AND s.ins_start_date < DATE '2021-06-07' - INTERVAL '1 year'
+                                    AND s.ins_end_date > DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND 2021 - c.birthyear BETWEEN 12 AND 15
+                                    AND p.date BETWEEN DATE '2021-06-07' - INTERVAL '1 year' AND DATE '2021-06-07' + INTERVAL '1 year'
+                                    AND c.n_vacc = 0
+
+                                               ") %>%
+  mutate(client_id = as.numeric(factor(client_id))) %>%
+  transmute(
+    person_id = client_id,
+    exposure_start_date = vaccination_date,
+    event_date,
+    observation_start_date = vaccination_date - days(365),
+    observation_end_date = vaccination_date + days(365)
+  )
+
+sccs_unvaccinated <- combined_unvaccinated_prescribed %>%
+  mutate(
+    event_day = as.integer(event_date - observation_start_date),
+    exposure_start_day = as.integer(exposure_start_date - observation_start_date),
+    observation_start_day = 0,
+    observation_end_day = as.integer(observation_end_date - observation_start_date)
+  )
+
+sccs_result_unvaccinated <- standardsccs(
+  formula = event_day ~ exposure_start_day,
+  indiv = person_id,
+  astart = observation_start_day,
+  aend = observation_end_day,
+  aevent = event_day,
+  adrug = exposure_start_day,
+  aedrug = exposure_start_day + 365,
+  expogrp = list(c(0, 14, 28, 60, 90, 180, 270)),
+  data = sccs_unvaccinated
+)
+
+print(sccs_result_unvaccinated)
+
+
+coef_unvax <- sccs_result_unvaccinated$coefficients
+conf_unvax <- sccs_result_unvaccinated$conf.int
+
+df_unvax <- data.frame(
+  term = rownames(coef_unvax),
+  logHR = coef_unvax[, "coef"],
+  SE = coef_unvax[, "se(coef)"],
+  HR = coef_unvax[, "exp(coef)"],
+  conf.low = conf_unvax[, "lower .95"],
+  conf.high = conf_unvax[, "upper .95"]
+)
+
+coef_vax <- sccs_result_vaccinated$coefficients
+conf_vax <- sccs_result_vaccinated$conf.int
+
+df_vax <- data.frame(
+  term = rownames(coef_vax),
+  logHR = coef_vax[, "coef"],
+  SE = coef_vax[, "se(coef)"],
+  HR = coef_vax[, "exp(coef)"],
+  conf.low = conf_vax[, "lower .95"],
+  conf.high = conf_vax[, "upper .95"]
+)
+
+df_unvax <- df_unvax %>% mutate(group = "Unvaccinated")
+df_vax <- df_vax %>% mutate(group = "Vaccinated")
+
+combined <- bind_rows(df_vax, df_unvax)
+
+combined$period <- as.integer(gsub("exposure_start_day", "", combined$term))
+
+start_days <- c(0, 14, 28, 60, 90, 180, 270)
+end_days   <- c(13, 27, 59, 89, 179, 269, Inf)
+
+period_labels <- paste0(start_days, "-", ifelse(is.infinite(end_days), "+", end_days))
+
+combined$period_label <- factor(combined$period,
+                                levels = seq_along(period_labels),
+                                labels = period_labels)
+
+ggplot(combined, aes(x = period_label, y = HR, color = group)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2,
+                position = position_dodge(width = 0.6)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(
+    x = "Cumulative Exposure Period (days)",
+    y = "Hazard Ratio (HR)",
+    title = "SCCS Vaccinated vs Unvaccinated Comparison"
+  ) +
+  theme_minimal()
+
+vax_df <- combined %>%
+  filter(group == "Vaccinated") %>%
+  rename_with(~ paste0(., "_vax"), -c(period, period_label))
+
+unvax_df <- combined %>%
+  filter(group == "Unvaccinated") %>%
+  rename_with(~ paste0(., "_unvax"), -c(period, period_label))
+
+df_diff <- inner_join(vax_df, unvax_df, by = c("period", "period_label"))
+
+df_diff <- df_diff %>%
+  mutate(
+    logHR_diff = logHR_vax - logHR_unvax,
+    se_diff = sqrt(SE_vax^2 + SE_unvax^2),
+    ci_low = logHR_diff - 1.96 * se_diff,
+    ci_high = logHR_diff + 1.96 * se_diff
+  )
+
+ggplot(df_diff, aes(x = period_label, y = logHR_diff)) +
+  geom_point(color = "blue", size = 3) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.2, color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Difference in log(Hazard Ratio) (Vaccinated - Unvaccinated)",
+    x = "Exposure Period",
+    y = "Difference in log(Hazard Ratio)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Riziko je v zásadě srovnatelné
+
+## Závěr: V populaci 16-29 (k roku 2021) dochází k výraznému nárustu předpisů v čase. Vysvětlením však může být samotné stárnutí populace. Prvopředpisovost mírně stoupá, ne však natolik, aby dokázala vysvětlit celkový nárůst. Ten je v první řadě způsoben multipředpisovostí. Vliv vakcinace na multipředpisovost je minimální.
+
+## SCCS prvopředpisů a celkového počtu předpisů +- 1 rok od rozhodného data vykazuje drobné odchylky, ne však natolik velké, aby bylo možné jednoznačně prokázat vliv vakcinace na předpisovost.
