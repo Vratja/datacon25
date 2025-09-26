@@ -7,7 +7,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r}
+```{r include=FALSE}
 rm(list=ls(all=TRUE))
 gc()
 library(dplyr)
@@ -24,6 +24,15 @@ con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
 ```
 
 # Data
+
+```{r}
+clients <- tbl(con, "ozp_clients") %>% as_tibble()
+clients %>% filter(age < 60) %>% summarize(mean(n_presc > 0))
+
+clients <- tbl(con, "cpzp_clients") %>% as_tibble()
+clients %>% summarize(mean(n_presc > 0))
+```
+
 
 ```{r}
 sexn <- tbl(con, "ozp_clients") %>% count(sex) %>% as_tibble()
@@ -139,6 +148,36 @@ ggplot(df_summary, aes(x = month_start, y = count, colour = age_gr, fill = age_g
 ```
 
 ```{r}
+df_summary <- tbl(con, "ozp_prescriptions") %>% 
+  left_join(
+    tbl(con, "ozp_clients") %>% mutate(age_gr = ntile(age, 5)) %>% select(client_id, age_gr), by = "client_id"
+  ) %>% 
+  arrange(client_id, date) %>%  
+  group_by(client_id) %>% mutate(event_order = row_number()) %>% filter(event_order == 1) %>% 
+  mutate(month_start = floor_date(date, unit = "month")) %>%
+  group_by(month_start, age_gr) %>% summarise(count = n(),  .groups = "drop") %>% 
+  as_tibble() %>% 
+  mutate(age_gr = factor(age_gr, levels = 1:5, labels = age_tbl$gr_names))
+
+ggplot(df_summary, aes(x = month_start, y = count, colour = age_gr, fill = age_gr)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth(color = "black", linewidth = 0.5) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(df_summary, aes(x = month_start, y = count, colour = age_gr, fill = age_gr)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth(color = "black", linewidth = 0.5) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~age_gr, scales = "free_y", ncol = 1, strip.position = "left")
+```
+
+```{r}
 df_wide <- df_summary %>% arrange(age_gr) %>% 
   tidyr::pivot_wider(names_from = age_gr, values_from = count, names_prefix = "age_")
 
@@ -152,5 +191,110 @@ ggcorrplot(df_corr,
            lab_size = 5, 
            colors = c("blue", "white", "red"),
            title = "Korelace mezi věkovými skupinami")
+```
+
+# Předpisy jednotlivých léků
+
+
+
+
+```{r}
+clients11 %>% count(n_vacc)
+```
+
+```{r}
+clients11 %>%
+  filter(n_vacc >= 3, event_order %in% c(2, 3)) %>%
+  arrange(client_id, vacc_date) %>% head(100) %>% 
+  group_by(client_id) %>%
+  summarise(
+    diff_days = as.numeric(diff(vacc_date)),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+clients11 %>% mutate(diff_month = floor(as.numeric(presc_date - vacc_date)/30)) %>% 
+  filter(event_order == 1, n_vacc %in% c(1,2, 3)) %>% 
+ggplot(aes(x = diff_month)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Počet předpisů ke dni vakcinace", x = "Měsíc relativně k vakcinaci", y = "Počet předpisů") + 
+  facet_wrap(~n_vacc, ncol = 1, strip.position = "right", 
+             labeller = labeller(n_vacc = function(x) paste0("počet dávek: ", x)))
+```
+
+```{r}
+cl01 <- tbl(con, "cpzp_clients") %>% filter(n_presc > 0) %>% as_tibble()
+
+presc <- tbl(con, "cpzp_prescriptions") %>% 
+  group_by(client_id) %>% 
+  summarise(presc_date = min(date), .groups = "drop")
+
+clients01 <- cl01 %>% 
+  left_join(presc, by = "client_id") %>% 
+  collect()
+
+clients01 %>% mutate(vaccination = n_vacc > 0, month_start = floor_date(presc_date, unit = "month")) %>% 
+  group_by(month_start, vaccination) %>% summarise(count = n(),  .groups = "drop") %>% 
+  ggplot(aes(month_start, count, col = vaccination, fill = vaccination)) +
+  geom_line()
+```
+
+
+```{r include=FALSE}
+tbl(con, "ozp_drugs_catalog") %>% count(drug_name)
+```
+
+```{r}
+
+```
+
+## multipředpisy
+
+```{r}
+cpzp <-  tbl(con, "cpzp_prescriptions") %>% as_tibble()
+```
+
+```{r}
+
+```
+
+
+```{r}
+splitline <- as.Date(c("2020-01-01", "2022-1-1"))
+
+df_diff <- tbl(con, "cpzp_prescriptions") %>% 
+  arrange(client_id, date) %>%
+  group_by(client_id) %>%
+  mutate(
+    order = row_number(),
+    diff_day = as.numeric(date - lag(date))
+  ) %>% as_tibble()
+
+df_diff <- df_diff %>% 
+  mutate(
+    split = case_when(
+      date <= splitline[1] ~ "<2020",
+      date <= splitline[2] ~ "2020-2021",
+      TRUE              ~ "2022>"
+    )
+  )%>% 
+  ungroup()
+df_diff
+```
+
+```{r}
+df_diff %>% filter(client_id == 741102)
+
+df_diff %>% filter(order %in% c(2:10), year(date) > 2016) %>% 
+  ggplot(aes(x = as.factor(order), diff_day, fill = split)) +
+  geom_boxplot(outliers = FALSE)
+```
+
+```{r}
+df_diff %>% filter(order %in% c(2:10), year(date) > 2016) %>% 
+  kruskal.test(diff_day ~ split, data = .)
 ```
 

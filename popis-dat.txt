@@ -1,7 +1,7 @@
 ## tables clients ##
 client_id 	- Id_pojistence • Unikátní identifikátor pojištěnce
 sex 		- Pohlavi • Pohlaví pojištěnce
-age 		-  2025-Rok_narozeni
+age 		- 2025-Rok_narozeni
 n_vacc 		- Pocet_vakcinaci  •	Počet vakcinací pro daného pojištěnce
 n_presc 	- Pocet_predpisu  •	Počet předpisů daného pojištěnce
 

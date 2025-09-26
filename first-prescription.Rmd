@@ -19,6 +19,7 @@ library(tibble)
 library(tidyr)
 library(ggcorrplot)
 library(SCCS)
+library(vcd)
 
 con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
 #dbDisconnect(con, shutdown = TRUE)
@@ -212,3 +213,47 @@ result <- standardsccs(
 )
 result
 ```
+
+Pouze klienti se dvěma dávkami
+
+```{r}
+cl <- clients11 %>% 
+  filter(n_vacc <= 3)  %>% 
+# filter(age < 30) %>% 
+  filter(event_order == 1, year(presc_date) %in% c(2020, 2021), year(vacc_date) %in% c(2021)) %>% 
+  transmute(client_id, vacc_day = as.integer(vacc_date - minDate), presc_day = as.integer(presc_date - minDate), age, sex) %>% 
+  mutate(astart = 1, aend = 2*365, id = 1:n())
+
+result <- standardsccs(formula = event ~ vacc_day,indiv = id,astart = astart,aend = aend,
+  aevent = presc_day,adrug = vacc_day,aedrug = vacc_day + 365,
+  expogrp = list(c(-100, 0, 20, 30, 120, 250, 300, 365)), data = cl
+)
+result
+```
+
+```{r}
+x <- cl %>% 
+  transmute(dif = vacc_day - presc_day, age, sex, id) %>% 
+  filter(abs(dif) < 120) %>% 
+  mutate(difGr = cut(dif, c(-Inf, 0, 20, 60, Inf)), difAge = cut(age, c(0, 30, 60, Inf))) %>% 
+  filter(!is.na(difGr))
+
+tab <- table(difGr = x$difGr,age = x$difAge)
+
+mosaic(tab, shade = TRUE, legend = TRUE)
+```
+
+```{r}
+presc %>%
+  left_join(cl11, by = "client_id") %>% 
+  mutate(age_gr = ntile(age, 5)) %>% 
+
+ggplot(aes(x = month_start, y = count, colour = age_gr, fill = age_gr)) +
+  geom_line() +
+  geom_point() +
+  geom_smooth(color = "black", linewidth = 0.5) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
