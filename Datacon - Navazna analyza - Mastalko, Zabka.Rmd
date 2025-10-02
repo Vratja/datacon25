@@ -46,7 +46,17 @@ con <- dbConnect(duckdb::duckdb(), dbdir = "data/datacon25.duckdb")
 #dbDisconnect(con, shutdown = TRUE)
 ```
 
-```{r, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+Pro analýzu byli vybráni klienti pojištění alespoň v období `2019-01-01` až `2022-12-31` a ve věku `16-29` v roce 2021. Jako datum vakcinace je vybrané datum první dávky a jako očkovaní jsou označeni klienti s alespoň jedním záznamem o očkování. Předpis je označený jako prvopředpis, pokud u daného klienta není sledovaný žádný předpis v minulosti (i před rokem 2019).
+
+Sledované jsou veškeré předpisy v ATC skupině `H02`.
+
+K vrcholu vakcinace došlo `2021-06-16`, jako rozhodné datum je tedy stanoveno `2021-06-23` a podmnožina očkovaných je omezena jen na očkované v rozmezí +- 14 dní od rozhodného data.
+
+* Počet očkovaných jedinců: 60 263
+* Počet neočkovaných jedinců: 99 451
+* Počet jedinců bez předpisu: 131 130
+
+```{r, results='hide', message=FALSE, warning=FALSE}
 prescriptions <- dbGetQuery(con,
                           "
                           SELECT
@@ -114,7 +124,13 @@ prescriptions <- dbGetQuery(con,
                            ymd("2021-06-23") + days(14)))
   )
 ```
-# DiD Analýza prvopředpisovosti 
+# DiD Analýza prvopředpisovosti
+
+Sledované období je +- 365 dní od datumu vakcinace a pro nečkované je jako datum vakcinace zvoleno `2021-06-23`. Použitá metrika je počet prvopředpisů ve zvoleném období (před vakcinací, po vakcinaci) na 1 000 dosud nepředepisovaných osob.
+
+Pro p-hodnotu míry změny uvnitř skupin (očkovaní a neočkovaní) je použita metoda [prop.test()]([https://www.rdocumentation.org/packages/stats/versions/3.6.2/topics/prop.test). Tento přístup není naprosto ideální, protože se nejedná o nezávislé množiny, ale pro orientační sledování je dostačující.
+
+P-hodnota DiD analýzy je měřena v rámci glm modelu `glm(event ~ period * vacc_status, data = indiv_long, family = binomial())` pro interakci kategorických proměnných `period:vacc_status.Vakcinace`.
 
 ```{r}
 fake_vacc_date <- as.Date("2021-06-23")
@@ -259,6 +275,8 @@ ggplot(plot_df, aes(x = vacc_status, y = rate, fill = period)) +
   theme_minimal()
 ```
 
+Podle grafu je patrná vyšší prvopředpisovost v obou skupinách s nižším nárustem u neočkované populace.
+
 ```{r, results = 'asis'}
 table1 %>%
   transmute(
@@ -275,13 +293,21 @@ table1 %>%
   )
 ```
 
+Relativní změna je v obou skupinách statisticky významná.
+
 ```{r, results = 'asis'}
 cat("```\n", paste(capture.output(print(summary(
   did_model
 ))), collapse = "\n"), "\n```")
 ```
 
+DiD analýza ovšem nevykazuje statisticky významný rozdíl mezi skupinami (p-hodnota interkace 0.17), jediný významný prediktor prvopředpisovosti je proměnná `period` (čili období před nebo po).
+
 # SCCS Prvopředpisy
+
+Zde je použita metoda [SCCS](https://cran.r-project.org/web/packages/SCCS/SCCS.pdf), konkrétně tedy `standardsccs()`. Samotný model je vydefinován `coxph(formula = Surv(rep(), event) ~ exposure_start_day + strata(indivL) + offset(log(interval)), data = chopdat, method = "exact")` (tedy Coxova regrese proporcionálních rizik). Zvolené období expozice jsou 0-29, 30-89, 90-179, 180-269 a 270-365 dní od vakcinace. Každé období je potom porovnáno s ostatními (včetně baseline 365 dní před vakcinací) a míra proporcionálního rizika (HR) je poté vyjádřena jako `exp(coef)` nebo jako log(HR) `coef`. Pro testování rozdílů mezi skupinami byl použit Waldův test na rozdíl `log(HR)` v rámci DiD analýzy.
+
+## Poměrné riziko prvopředpisů očkovaných
 
 ```{r, results = 'asis'}
 vaccinated_prescribed <- prescriptions %>%
@@ -324,6 +350,10 @@ cat("```\n", paste(capture.output(print(
 )), collapse = "\n"), "\n```")
 ```
 
+Všeobecně je riziko větší ve všech sledovaných periodách. Statistická významnost je nejvyráznější v poslední expozici (270+ dní).
+
+## Poměrné riziko prvopředpisů neočkovaných
+
 ```{r, results = 'asis'}
 unvaccinated_prescribed <- prescriptions %>%
   filter(
@@ -364,6 +394,10 @@ cat("```\n", paste(capture.output(print(
   sccs_result_unvaccinated
 )), collapse = "\n"), "\n```")
 ```
+
+U neočkované populace je riziko také ve všech případech vyšší. Signifikantní výsledky jsou v prvním (0-29 dní) a posledním (270+ dní) období.
+
+## Porovnání poměrných rizik
 
 ```{r}
 coef_unvax <- sccs_result_unvaccinated$coefficients
@@ -420,6 +454,8 @@ ggplot(combined, aes(x = period_label, y = HR, color = group)) +
   theme_minimal()
 ```
 
+Patrná je "výměna" pořadí míry rizika zhruba v obodbí 90-179 dní od vakcinace. Všeobecně je ale také zřejmý srovnatelný trend růstu a poklesu.
+
 ```{r}
 vax_df <- combined %>%
   filter(group == "Vakcinace") %>%
@@ -451,6 +487,8 @@ ggplot(df_diff, aes(x = period_label, y = logHR_diff)) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
+
+Logaritmus proporcionálních rizik je možné také porovnat mezi sebou a určit "více rizikovou skupinu" pro každé období. Zde je stejně patrná výměna pozic z hlediska relativního rizika v neprospěch očkovaných v období 90-179 dní od vakcinace.
 
 ```{r, results = 'asis'}
 common_terms <- intersect(df_vax$term, df_unvax$term)
@@ -512,7 +550,13 @@ did_results %>%
   )
 ```
 
+Jediný statisticky významný výsledek je následně v období 180-269 dní od vakcinace (což je patrné i na grafu výše) s pozitivním efektem pro neočkované (nižší poměrné riziko).
+
 # SCCS Předpisy celkem
+
+Metodika je téměř identická jako u předchozí analýzy. V tomto případě jsou ale zahrnuty veškeré předpisy a z důvodu stejné váhy jsou předpisy injekcí a infuzí v rámci 10-denního okna agregovány do jednoho předpisu.
+
+## Poměrné riziko předpisů očkovaných
 
 ```{r, results = 'asis'}
 vaccinated_prescribed_multi <- prescriptions %>%
@@ -579,6 +623,10 @@ cat("```\n", paste(capture.output(print(
 )), collapse = "\n"), "\n```")
 ```
 
+Zde je opět riziko ve všech případech vyšší s rostoucí tendencí v čase. Statisticky významné jsou téměř všechny výsledky vyjma prvního okna.
+
+## Poměrné riziko předpisů neočkovaných
+
 ```{r, results = 'asis'}
 unvaccinated_prescribed_multi <- prescriptions %>%
   filter(
@@ -644,6 +692,10 @@ cat("```\n", paste(capture.output(print(
 )), collapse = "\n"), "\n```")
 ```
 
+U neočkované populace dochází k menšímu výkyvu a riziko po vakcinaci je stabilnější. I v tomto případě je ale vždy vyšší.
+
+## Porovnání poměrného rizika
+
 ```{r}
 coef_unvax <- sccs_result_unvaccinated_multi$coefficients
 conf_unvax <- sccs_result_unvaccinated_multi$conf.int
@@ -699,6 +751,8 @@ ggplot(combined, aes(x = period_label, y = HR, color = group)) +
   theme_minimal()
 ```
 
+Všeobecný trend vykazuje podobné známky jako trend prvopředpisů. K "výměně pozic" dochází ale už ve druhém sledovaném období (tedy 30-89 dní od vakcinace).
+
 ```{r}
 vax_df <- combined %>%
   filter(group == "Vaccinated") %>%
@@ -730,6 +784,8 @@ ggplot(df_diff, aes(x = period_label, y = logHR_diff)) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
+
+Porovnání log(HR) opět potvrzuje zjištění z předchozího grafu s rostoucím vyšším rizikem pro očkované ke konci.
 
 ```{r, results = 'asis'}
 common_terms <- intersect(df_vax$term, df_unvax$term)
@@ -790,3 +846,5 @@ did_results %>%
     full_width = TRUE
   )
 ```
+
+Jediný statisticky významný výsledek je pro poslední sledované období s vyšší mírou rizika pro očkované.
